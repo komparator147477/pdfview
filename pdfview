@@ -1,0 +1,352 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "pymupdf>=1.24.0",
+# ]
+# ///
+"""Terminal PDF inspection and cleanup for scanned documents."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import termios
+import tty
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import fitz
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"pdfview: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def chafa_format() -> str:
+    term = (os.environ.get("TERM") or "").lower()
+    if os.environ.get("PDFVIEW_CHAFA_FORMAT"):
+        return os.environ["PDFVIEW_CHAFA_FORMAT"]
+    if os.environ.get("KITTY_WINDOW_ID") or "ghostty" in term:
+        return "kitty"
+    if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+        return "iterm"
+    return "symbols"
+
+
+def read_key() -> str:
+    if not sys.stdin.isatty():
+        return sys.stdin.read(1) or "q"
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        c = sys.stdin.read(1)
+        if c == "\x1b":
+            extra = sys.stdin.read(2)
+            return c + extra if extra else c
+        return c
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def prompt(text: str) -> str:
+    if sys.stdin.isatty():
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return input(text)
+
+
+def parse_pages(spec: str, total: int) -> set[int]:
+    pages: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            start, end = int(a), int(b)
+            if start > end:
+                start, end = end, start
+            pages.update(range(start - 1, end))
+        else:
+            pages.add(int(part) - 1)
+    bad = [p + 1 for p in pages if p < 0 or p >= total]
+    if bad:
+        raise ValueError(f"page out of range: {bad[0]}")
+    return pages
+
+
+@dataclass
+class State:
+    path: Path
+    doc: fitz.Document
+    out: Path
+    overwrite: bool
+    page: int = 0
+    zoom: float = 2.0
+    selected: set[int] = field(default_factory=set)
+    dirty: bool = False
+    message: str = ""
+
+    def targets(self) -> list[int]:
+        return sorted(self.selected) if self.selected else [self.page]
+
+    def clamp_page(self) -> None:
+        if len(self.doc) == 0:
+            self.page = 0
+        else:
+            self.page = max(0, min(self.page, len(self.doc) - 1))
+        self.selected = {p for p in self.selected if p < len(self.doc)}
+
+
+def render_page(doc: fitz.Document, page_index: int, zoom: float) -> Path:
+    page = doc[page_index]
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    f = tempfile.NamedTemporaryFile(prefix="pdfview-", suffix=".png", delete=False)
+    f.close()
+    out = Path(f.name)
+    pix.save(out)
+    return out
+
+
+def show(state: State, fmt: str) -> None:
+    cols, rows = shutil.get_terminal_size((100, 40))
+    print("\033[2J\033[H", end="")
+    if len(state.doc) == 0:
+        print("pdfview: all pages deleted; save or quit")
+        return
+    png = render_page(state.doc, state.page, state.zoom)
+    try:
+        dirty = "*" if state.dirty else "-"
+        header = (
+            f"{state.path.name} | page {state.page + 1}/{len(state.doc)} | "
+            f"zoom {state.zoom:.1f} | selected {len(state.selected)} | {dirty} | out {state.out}"
+        )
+        print(header[:cols])
+        subprocess.run(
+            [
+                "chafa",
+                "--clear",
+                "--animate=off",
+                f"--format={fmt}",
+                f"--size={cols}x{max(5, rows - 4)}",
+                str(png),
+            ],
+            check=False,
+        )
+        footer = "n/p g/G +/-/0 m :select :clear r/R M d :move c s q"
+        if state.message:
+            footer = f"{state.message} | {footer}"
+            state.message = ""
+        print(footer[:cols], flush=True)
+    finally:
+        png.unlink(missing_ok=True)
+
+
+def rotate(state: State, degrees: int) -> None:
+    for i in state.targets():
+        page = state.doc[i]
+        page.set_rotation((page.rotation + degrees) % 360)
+    state.dirty = True
+
+
+def mirror(state: State) -> None:
+    for i in state.targets():
+        page = state.doc[i]
+        rect = page.rect
+        matrix = fitz.Matrix(-2, 0, 0, 2, rect.width * 2, 0)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        state.doc.delete_page(i)
+        new_page = state.doc.new_page(pno=i, width=rect.width, height=rect.height)
+        new_page.insert_image(new_page.rect, pixmap=pix)
+    state.dirty = True
+
+
+def delete_pages(state: State) -> None:
+    targets = state.targets()
+    state.doc.delete_pages(targets)
+    state.selected.clear()
+    state.clamp_page()
+    state.dirty = True
+
+
+def move_pages(state: State, target_page_1: int) -> None:
+    total = len(state.doc)
+    targets = state.targets()
+    target = target_page_1 - 1
+    if target < 0 or target > total:
+        raise ValueError("target page out of range")
+    if target in targets:
+        raise ValueError("target is inside moved selection")
+    new = fitz.open()
+    target_ids = set(targets)
+    remaining = [i for i in range(total) if i not in target_ids]
+    insert_at = max(0, min(target, len(remaining)))
+    order = remaining[:insert_at] + targets + remaining[insert_at:]
+    for i in order:
+        new.insert_pdf(state.doc, from_page=i, to_page=i)
+    state.doc.close()
+    state.doc = new
+    state.selected.clear()
+    state.page = insert_at
+    state.dirty = True
+
+
+def crop_pages(state: State) -> None:
+    pages = state.targets()
+    margins = [0.0, 0.0, 0.0, 0.0]
+    edge = 0
+    names = ["left", "top", "right", "bottom"]
+    step = 5.0
+    while True:
+        state.message = f"crop {names[edge]} LTRB={','.join(str(int(x)) for x in margins)}"
+        show(state, chafa_format())
+        c = read_key()
+        if c in ("\x1b", "q"):
+            state.message = "crop cancelled"
+            return
+        if c in ("\t",):
+            edge = (edge + 1) % 4
+        elif c in ("\r", "\n"):
+            for i in pages:
+                page = state.doc[i]
+                r = page.cropbox
+                nr = fitz.Rect(r.x0 + margins[0], r.y0 + margins[1], r.x1 - margins[2], r.y1 - margins[3])
+                if nr.is_empty or nr.width < 10 or nr.height < 10:
+                    raise ValueError("crop rectangle is too small")
+                page.set_cropbox(nr)
+            state.dirty = True
+            state.message = "crop applied"
+            return
+        elif c in ("h", "j", "k", "l", "H", "J", "K", "L"):
+            amount = 25.0 if c.isupper() else step
+            idx = {"h": 0, "k": 1, "l": 2, "j": 3}[c.lower()]
+            margins[idx] = max(0.0, margins[idx] + amount)
+            edge = idx
+        elif c in ("-", "_"):
+            margins[edge] = max(0.0, margins[edge] - step)
+
+
+def save(state: State, allow_existing: bool = False) -> None:
+    out = state.path if state.overwrite else state.out
+    if out.exists() and out != state.path and not allow_existing:
+        answer = prompt(f"{out} exists. Overwrite? [y/N] ")
+        if answer.lower() != "y":
+            state.message = "save cancelled"
+            return
+    state.doc.save(out, garbage=4, deflate=True)
+    state.dirty = False
+    if shutil.which("qpdf"):
+        result = subprocess.run(["qpdf", "--check", str(out)], capture_output=True, text=True)
+        state.message = "saved; qpdf ok" if result.returncode == 0 else "saved; qpdf check failed"
+    else:
+        state.message = "saved; qpdf not found"
+
+
+def command(state: State, line: str) -> None:
+    parts = line.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].lstrip(":")
+    if cmd == "page" and len(parts) == 2:
+        state.page = max(0, min(int(parts[1]) - 1, len(state.doc) - 1))
+    elif cmd == "select" and len(parts) == 2:
+        state.selected = parse_pages(parts[1], len(state.doc))
+    elif cmd == "clear":
+        state.selected.clear()
+    elif cmd == "move" and len(parts) == 2:
+        move_pages(state, int(parts[1]))
+    else:
+        state.message = f"unknown command: {line}"
+
+
+def default_out(path: Path) -> Path:
+    return path.with_name(f"{path.stem}-edited.pdf")
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description="Terminal PDF viewer/editor for scanned PDF cleanup.")
+    p.add_argument("pdf")
+    p.add_argument("--page", type=int, default=1)
+    p.add_argument("--zoom", type=float, default=2.0)
+    p.add_argument("--out", type=Path)
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--format", choices=["kitty", "sixels", "iterm", "symbols"], default=None)
+    args = p.parse_args(argv)
+
+    path = Path(args.pdf).expanduser().resolve()
+    if not path.exists():
+        die(f"not found: {path}")
+    if not path.is_file():
+        die(f"not a file: {path}")
+    if not shutil.which("chafa"):
+        die("chafa is required; install it with your system package manager")
+
+    try:
+        doc = fitz.open(path)
+    except Exception as exc:
+        die(f"cannot open PDF: {exc}")
+    if not doc.is_pdf:
+        die("PDF input required")
+    if len(doc) == 0:
+        die("empty PDF")
+
+    out = path if args.overwrite else (args.out.resolve() if args.out else default_out(path))
+    state = State(path=path, doc=doc, out=out, overwrite=args.overwrite, page=args.page - 1, zoom=args.zoom)
+    state.clamp_page()
+    fmt = args.format or chafa_format()
+
+    while True:
+        show(state, fmt)
+        c = read_key()
+        try:
+            if c in ("q", "\x03", "\x1b"):
+                if state.dirty:
+                    answer = prompt("Unsaved changes. Quit anyway? [y/N] ")
+                    if answer.lower() != "y":
+                        continue
+                print("\033[2J\033[H", end="")
+                return 0
+            if c in ("n", " ", "\x1b[C"):
+                state.page = min(len(state.doc) - 1, state.page + 1)
+            elif c in ("p", "\x1b[D"):
+                state.page = max(0, state.page - 1)
+            elif c == "g":
+                state.page = 0
+            elif c == "G":
+                state.page = len(state.doc) - 1
+            elif c in ("+", "="):
+                state.zoom = min(6.0, state.zoom + 0.5)
+            elif c in ("-", "_"):
+                state.zoom = max(0.5, state.zoom - 0.5)
+            elif c == "0":
+                state.zoom = 2.0
+            elif c == "m":
+                state.selected.symmetric_difference_update({state.page})
+            elif c == "r":
+                rotate(state, 90)
+            elif c == "R":
+                rotate(state, -90)
+            elif c == "M":
+                mirror(state)
+            elif c == "d":
+                delete_pages(state)
+            elif c == "c":
+                crop_pages(state)
+            elif c == "s":
+                save(state)
+            elif c == ":":
+                command(state, prompt(":"))
+        except Exception as exc:
+            state.message = str(exc)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
