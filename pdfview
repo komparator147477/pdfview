@@ -363,7 +363,7 @@ def scan_pages(state: State) -> None:
         tmp_path = Path(tmp.name)
         tmp.close()
         try:
-            result = subprocess.run(["hp-scan", "-o", str(tmp_path)], check=False)
+            result = subprocess.run(["hp-scan", "--dest=file", "--filetype=pdf", "-o", str(tmp_path)], check=False)
             if result.returncode != 0:
                 raise ValueError(f"hp-scan failed with exit code {result.returncode}")
             total += append_pdf(state, tmp_path)
