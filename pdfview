@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import fitz
+
+A4 = fitz.paper_rect("a4")
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".jfif",
+    ".jp2",
+    ".jpe",
+    ".jpeg",
+    ".jpg",
+    ".jpx",
+    ".pam",
+    ".pbm",
+    ".pgm",
+    ".png",
+    ".pnm",
+    ".ppm",
+    ".psd",
+    ".tif",
+    ".tiff",
+}
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -83,9 +105,18 @@ def parse_pages(spec: str, total: int) -> set[int]:
     return pages
 
 
+def fit_rect(src: fitz.Rect, dst: fitz.Rect) -> fitz.Rect:
+    scale = min(dst.width / src.width, dst.height / src.height)
+    width = src.width * scale
+    height = src.height * scale
+    x0 = dst.x0 + (dst.width - width) / 2
+    y0 = dst.y0 + (dst.height - height) / 2
+    return fitz.Rect(x0, y0, x0 + width, y0 + height)
+
+
 @dataclass
 class State:
-    path: Path
+    path: Path | None
     doc: fitz.Document
     out: Path
     overwrite: bool
@@ -96,6 +127,8 @@ class State:
     message: str = ""
 
     def targets(self) -> list[int]:
+        if len(self.doc) == 0:
+            return []
         return sorted(self.selected) if self.selected else [self.page]
 
     def clamp_page(self) -> None:
@@ -120,13 +153,20 @@ def show(state: State, fmt: str) -> None:
     cols, rows = shutil.get_terminal_size((100, 40))
     print("\033[2J\033[H", end="")
     if len(state.doc) == 0:
-        print("pdfview: all pages deleted; save or quit")
+        dirty = "*" if state.dirty else "-"
+        header = f"pdfview: empty document | selected 0 | {dirty} | out {state.out}"
+        print(header[:cols])
+        footer = "S scan | :scan | :add image... | s save | q quit"
+        if state.message:
+            footer = f"{state.message} | {footer}"
+            state.message = ""
+        print(footer[:cols], flush=True)
         return
     png = render_page(state.doc, state.page, state.zoom)
     try:
         dirty = "*" if state.dirty else "-"
         header = (
-            f"{state.path.name} | page {state.page + 1}/{len(state.doc)} | "
+            f"{state.path.name if state.path else 'new document'} | page {state.page + 1}/{len(state.doc)} | "
             f"zoom {state.zoom:.1f} | selected {len(state.selected)} | {dirty} | out {state.out}"
         )
         print(header[:cols])
@@ -141,7 +181,7 @@ def show(state: State, fmt: str) -> None:
             ],
             check=False,
         )
-        footer = "n/p g/G +/-/0 m :select :clear r/R M d :move c s q"
+        footer = "n/p g/G +/-/0 m :select :clear r/R M d :move c S :scan :add s q"
         if state.message:
             footer = f"{state.message} | {footer}"
             state.message = ""
@@ -236,6 +276,10 @@ def crop_pages(state: State) -> None:
 
 def save(state: State, allow_existing: bool = False) -> None:
     out = state.path if state.overwrite else state.out
+    if out is None:
+        raise ValueError("no output path")
+    if len(state.doc) == 0:
+        raise ValueError("cannot save empty document")
     if out.exists() and out != state.path and not allow_existing:
         answer = prompt(f"{out} exists. Overwrite? [y/N] ")
         if answer.lower() != "y":
@@ -250,8 +294,90 @@ def save(state: State, allow_existing: bool = False) -> None:
         state.message = "saved; qpdf not found"
 
 
+def append_pdf(state: State, path: Path) -> int:
+    before = len(state.doc)
+    try:
+        src = fitz.open(path)
+    except Exception as exc:
+        raise ValueError(f"cannot open PDF: {path}: {exc}") from exc
+    try:
+        if not src.is_pdf:
+            raise ValueError(f"PDF input required: {path}")
+        if len(src) == 0:
+            raise ValueError(f"empty PDF: {path}")
+        state.doc.insert_pdf(src)
+    finally:
+        src.close()
+    state.page = before
+    state.dirty = True
+    state.clamp_page()
+    return len(state.doc) - before
+
+
+def append_image(state: State, path: Path) -> None:
+    image = None
+    converted = None
+    try:
+        image = fitz.open(path)
+        if len(image) == 0:
+            raise ValueError(f"empty image: {path}")
+        converted = fitz.open("pdf", image.convert_to_pdf())
+        page = state.doc.new_page(width=A4.width, height=A4.height)
+        page.show_pdf_page(fit_rect(converted[0].rect, A4), converted, 0)
+    except Exception as exc:
+        raise ValueError(f"cannot add image: {path}: {exc}") from exc
+    finally:
+        if converted is not None:
+            converted.close()
+        if image is not None:
+            image.close()
+    state.page = len(state.doc) - 1
+    state.dirty = True
+    state.clamp_page()
+
+
+def add_files(state: State, paths: list[str]) -> None:
+    if not paths:
+        raise ValueError("usage: :add image-or-pdf [...]")
+    added = 0
+    for raw in paths:
+        path = Path(raw).expanduser().resolve()
+        if not path.exists():
+            raise ValueError(f"not found: {raw}")
+        if not path.is_file():
+            raise ValueError(f"not a file: {raw}")
+        if path.suffix.lower() in IMAGE_EXTENSIONS:
+            append_image(state, path)
+            added += 1
+        else:
+            added += append_pdf(state, path)
+    state.message = f"added {added} page{'s' if added != 1 else ''}"
+
+
+def scan_pages(state: State) -> None:
+    if not shutil.which("hp-scan"):
+        raise ValueError("hp-scan not found")
+    total = 0
+    while True:
+        tmp = tempfile.NamedTemporaryFile(prefix="pdfview-scan-", suffix=".pdf", delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        try:
+            result = subprocess.run(["hp-scan", "-o", str(tmp_path)], check=False)
+            if result.returncode != 0:
+                raise ValueError(f"hp-scan failed with exit code {result.returncode}")
+            total += append_pdf(state, tmp_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        again = prompt("Scan another page? [y/N] ")
+        if again.lower() != "y":
+            break
+    state.message = f"scanned {total} page{'s' if total != 1 else ''}"
+
+
 def command(state: State, line: str) -> None:
-    parts = line.strip().split()
+    parts = shlex.split(line.strip())
     if not parts:
         return
     cmd = parts[0].lstrip(":")
@@ -263,6 +389,10 @@ def command(state: State, line: str) -> None:
         state.selected.clear()
     elif cmd == "move" and len(parts) == 2:
         move_pages(state, int(parts[1]))
+    elif cmd == "scan":
+        scan_pages(state)
+    elif cmd == "add":
+        add_files(state, parts[1:])
     else:
         state.message = f"unknown command: {line}"
 
@@ -273,7 +403,7 @@ def default_out(path: Path) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Terminal PDF viewer/editor for scanned PDF cleanup.")
-    p.add_argument("pdf")
+    p.add_argument("pdf", nargs="?")
     p.add_argument("--page", type=int, default=1)
     p.add_argument("--zoom", type=float, default=2.0)
     p.add_argument("--out", type=Path)
@@ -281,29 +411,31 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--format", choices=["kitty", "sixels", "iterm", "symbols"], default=None)
     args = p.parse_args(argv)
 
-    path = Path(args.pdf).expanduser().resolve()
-    if not path.exists():
-        die(f"not found: {path}")
-    if not path.is_file():
-        die(f"not a file: {path}")
-    if not shutil.which("chafa"):
-        die("chafa is required; install it with your system package manager")
+    path = Path(args.pdf).expanduser().resolve() if args.pdf else None
+    if path is None:
+        doc = fitz.open()
+    else:
+        if not path.exists():
+            die(f"not found: {path}")
+        if not path.is_file():
+            die(f"not a file: {path}")
+        try:
+            doc = fitz.open(path)
+        except Exception as exc:
+            die(f"cannot open PDF: {exc}")
+        if not doc.is_pdf:
+            die("PDF input required")
+        if len(doc) == 0:
+            die("empty PDF")
 
-    try:
-        doc = fitz.open(path)
-    except Exception as exc:
-        die(f"cannot open PDF: {exc}")
-    if not doc.is_pdf:
-        die("PDF input required")
-    if len(doc) == 0:
-        die("empty PDF")
-
-    out = path if args.overwrite else (args.out.resolve() if args.out else default_out(path))
+    out = path if args.overwrite and path else (args.out.resolve() if args.out else (default_out(path) if path else Path("scan.pdf").resolve()))
     state = State(path=path, doc=doc, out=out, overwrite=args.overwrite, page=args.page - 1, zoom=args.zoom)
     state.clamp_page()
     fmt = args.format or chafa_format()
 
     while True:
+        if len(state.doc) > 0 and not shutil.which("chafa"):
+            die("chafa is required; install it with your system package manager")
         show(state, fmt)
         c = read_key()
         try:
@@ -315,13 +447,15 @@ def main(argv: list[str] | None = None) -> int:
                 print("\033[2J\033[H", end="")
                 return 0
             if c in ("n", " ", "\x1b[C"):
-                state.page = min(len(state.doc) - 1, state.page + 1)
+                if len(state.doc) > 0:
+                    state.page = min(len(state.doc) - 1, state.page + 1)
             elif c in ("p", "\x1b[D"):
                 state.page = max(0, state.page - 1)
             elif c == "g":
                 state.page = 0
             elif c == "G":
-                state.page = len(state.doc) - 1
+                if len(state.doc) > 0:
+                    state.page = len(state.doc) - 1
             elif c in ("+", "="):
                 state.zoom = min(6.0, state.zoom + 0.5)
             elif c in ("-", "_"):
@@ -340,6 +474,8 @@ def main(argv: list[str] | None = None) -> int:
                 delete_pages(state)
             elif c == "c":
                 crop_pages(state)
+            elif c == "S":
+                scan_pages(state)
             elif c == "s":
                 save(state)
             elif c == ":":
