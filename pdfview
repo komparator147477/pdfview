@@ -121,15 +121,15 @@ class State:
     out: Path
     overwrite: bool
     page: int = 0
-    zoom: float = 2.0
     selected: set[int] = field(default_factory=set)
     dirty: bool = False
     message: str = ""
+    history: list[str] = field(default_factory=list)
 
-    def targets(self) -> list[int]:
+    def targets(self, use_selection: bool = True) -> list[int]:
         if len(self.doc) == 0:
             return []
-        return sorted(self.selected) if self.selected else [self.page]
+        return sorted(self.selected) if use_selection and self.selected else [self.page]
 
     def clamp_page(self) -> None:
         if len(self.doc) == 0:
@@ -139,9 +139,14 @@ class State:
         self.selected = {p for p in self.selected if p < len(self.doc)}
 
 
-def render_page(doc: fitz.Document, page_index: int, zoom: float) -> Path:
+def add_history(state: State, message: str) -> None:
+    state.history.append(message)
+    state.history = state.history[-3:]
+
+
+def render_page(doc: fitz.Document, page_index: int) -> Path:
     page = doc[page_index]
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
     f = tempfile.NamedTemporaryFile(prefix="pdfview-", suffix=".png", delete=False)
     f.close()
     out = Path(f.name)
@@ -161,13 +166,15 @@ def show(state: State, fmt: str) -> None:
             footer = f"{state.message} || {footer}"
             state.message = ""
         print(footer[:cols], flush=True)
+        if state.history:
+            print(("Recent: " + " | ".join(state.history))[:cols], flush=True)
         return
-    png = render_page(state.doc, state.page, state.zoom)
+    png = render_page(state.doc, state.page)
     try:
         dirty = "*" if state.dirty else "-"
         header = (
             f"{state.path.name if state.path else 'new document'} | page {state.page + 1}/{len(state.doc)} | "
-            f"zoom {state.zoom:.1f} | selected {len(state.selected)} | {dirty} | out {state.out}"
+            f"selected {len(state.selected)} | {dirty} | out {state.out}"
         )
         print(header[:cols])
         subprocess.run(
@@ -181,26 +188,36 @@ def show(state: State, fmt: str) -> None:
             ],
             check=False,
         )
-        footer_top = "Move: n/p, g/G | View: +/-/0 | Select: m, :select, :clear"
+        footer_top = "Move: n/p, g/G | Select: m, :select, :clear"
         footer_bottom = "Edit: r/R rotate, M mirror, d delete, :move, c crop | Add: S scan, :add | File: s save, q quit"
         if state.message:
             footer_top = f"{state.message} || {footer_top}"
             state.message = ""
         print(footer_top[:cols])
         print(footer_bottom[:cols], flush=True)
+        if state.history:
+            print(("Recent: " + " | ".join(state.history))[:cols], flush=True)
     finally:
         png.unlink(missing_ok=True)
 
 
-def rotate(state: State, degrees: int) -> None:
-    for i in state.targets():
+def page_list_label(pages: list[int]) -> str:
+    return ", ".join(str(page + 1) for page in pages)
+
+
+def rotate(state: State, degrees: int, use_selection: bool = True) -> None:
+    targets = state.targets(use_selection)
+    for i in targets:
         page = state.doc[i]
         page.set_rotation((page.rotation + degrees) % 360)
     state.dirty = True
+    direction = "right" if degrees > 0 else "left"
+    add_history(state, f"rotate {direction}: page {page_list_label(targets)}")
 
 
-def mirror(state: State) -> None:
-    for i in state.targets():
+def mirror(state: State, use_selection: bool = True) -> None:
+    targets = state.targets(use_selection)
+    for i in targets:
         page = state.doc[i]
         rect = page.rect
         matrix = fitz.Matrix(-2, 0, 0, 2, rect.width * 2, 0)
@@ -209,19 +226,21 @@ def mirror(state: State) -> None:
         new_page = state.doc.new_page(pno=i, width=rect.width, height=rect.height)
         new_page.insert_image(new_page.rect, pixmap=pix)
     state.dirty = True
+    add_history(state, f"mirror: page {page_list_label(targets)}")
 
 
-def delete_pages(state: State) -> None:
-    targets = state.targets()
+def delete_pages(state: State, use_selection: bool = True) -> None:
+    targets = state.targets(use_selection)
     state.doc.delete_pages(targets)
     state.selected.clear()
     state.clamp_page()
     state.dirty = True
+    add_history(state, f"delete: page {page_list_label(targets)}")
 
 
-def move_pages(state: State, target_page_1: int) -> None:
+def move_pages(state: State, target_page_1: int, use_selection: bool = True) -> None:
     total = len(state.doc)
-    targets = state.targets()
+    targets = state.targets(use_selection)
     target = target_page_1 - 1
     if target < 0 or target > total:
         raise ValueError("target page out of range")
@@ -239,10 +258,11 @@ def move_pages(state: State, target_page_1: int) -> None:
     state.selected.clear()
     state.page = insert_at
     state.dirty = True
+    add_history(state, f"move page {page_list_label(targets)} before {target_page_1}")
 
 
-def crop_pages(state: State) -> None:
-    pages = state.targets()
+def crop_pages(state: State, use_selection: bool = True) -> None:
+    pages = state.targets(use_selection)
     margins = [0.0, 0.0, 0.0, 0.0]
     edge = 0
     names = ["left", "top", "right", "bottom"]
@@ -266,6 +286,7 @@ def crop_pages(state: State) -> None:
                 page.set_cropbox(nr)
             state.dirty = True
             state.message = "crop applied"
+            add_history(state, f"crop: page {page_list_label(pages)}")
             return
         elif c in ("h", "j", "k", "l", "H", "J", "K", "L"):
             amount = 25.0 if c.isupper() else step
@@ -294,6 +315,7 @@ def save(state: State, allow_existing: bool = False) -> None:
         state.message = "saved; qpdf ok" if result.returncode == 0 else "saved; qpdf check failed"
     else:
         state.message = "saved; qpdf not found"
+    add_history(state, f"save: {out.name}")
 
 
 def append_pdf(state: State, path: Path) -> int:
@@ -313,6 +335,7 @@ def append_pdf(state: State, path: Path) -> int:
     state.page = before
     state.dirty = True
     state.clamp_page()
+    add_history(state, f"add PDF: {path.name}")
     return len(state.doc) - before
 
 
@@ -336,6 +359,7 @@ def append_image(state: State, path: Path) -> None:
     state.page = len(state.doc) - 1
     state.dirty = True
     state.clamp_page()
+    add_history(state, f"add image: {path.name}")
 
 
 def add_files(state: State, paths: list[str]) -> None:
@@ -376,6 +400,7 @@ def scan_pages(state: State) -> None:
         if again.lower() != "y":
             break
     state.message = f"scanned {total} page{'s' if total != 1 else ''}"
+    add_history(state, f"scan: {total} page{'s' if total != 1 else ''}")
 
 
 def command(state: State, line: str) -> None:
@@ -385,10 +410,13 @@ def command(state: State, line: str) -> None:
     cmd = parts[0].lstrip(":")
     if cmd == "page" and len(parts) == 2:
         state.page = max(0, min(int(parts[1]) - 1, len(state.doc) - 1))
+        add_history(state, f"go to page {state.page + 1}")
     elif cmd == "select" and len(parts) == 2:
         state.selected = parse_pages(parts[1], len(state.doc))
+        add_history(state, f"select: page {page_list_label(sorted(state.selected))}")
     elif cmd == "clear":
         state.selected.clear()
+        add_history(state, "clear selection")
     elif cmd == "move" and len(parts) == 2:
         move_pages(state, int(parts[1]))
     elif cmd == "scan":
@@ -407,7 +435,6 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Terminal PDF viewer/editor for scanned PDF cleanup.")
     p.add_argument("pdf", nargs="?")
     p.add_argument("--page", type=int, default=1)
-    p.add_argument("--zoom", type=float, default=2.0)
     p.add_argument("--out", type=Path)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--format", choices=["kitty", "sixels", "iterm", "symbols"], default=None)
@@ -431,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             die("empty PDF")
 
     out = path if args.overwrite and path else (args.out.resolve() if args.out else (default_out(path) if path else Path("scan.pdf").resolve()))
-    state = State(path=path, doc=doc, out=out, overwrite=args.overwrite, page=args.page - 1, zoom=args.zoom)
+    state = State(path=path, doc=doc, out=out, overwrite=args.overwrite, page=args.page - 1)
     state.clamp_page()
     fmt = args.format or chafa_format()
 
@@ -458,24 +485,20 @@ def main(argv: list[str] | None = None) -> int:
             elif c == "G":
                 if len(state.doc) > 0:
                     state.page = len(state.doc) - 1
-            elif c in ("+", "="):
-                state.zoom = min(6.0, state.zoom + 0.5)
-            elif c in ("-", "_"):
-                state.zoom = max(0.5, state.zoom - 0.5)
-            elif c == "0":
-                state.zoom = 2.0
             elif c == "m":
                 state.selected.symmetric_difference_update({state.page})
+                verb = "selected" if state.page in state.selected else "unselected"
+                add_history(state, f"{verb}: page {state.page + 1}")
             elif c == "r":
-                rotate(state, 90)
+                rotate(state, 90, use_selection=False)
             elif c == "R":
-                rotate(state, -90)
+                rotate(state, -90, use_selection=False)
             elif c == "M":
-                mirror(state)
+                mirror(state, use_selection=False)
             elif c == "d":
-                delete_pages(state)
+                delete_pages(state, use_selection=False)
             elif c == "c":
-                crop_pages(state)
+                crop_pages(state, use_selection=False)
             elif c == "S":
                 scan_pages(state)
             elif c == "s":

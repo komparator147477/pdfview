@@ -19,10 +19,11 @@ pdfview() {
 }
 ```
 
-Keys: `n/p` or arrows to navigate, `g/G` first/last, `+/-/0` zoom,
-`m` mark page, `:select 1,3-5`, `:clear`, `r/R` rotate, `M` mirror,
-`d` delete, `:move N`, `c` crop, `S` scan with `hp-scan`, `:add image.jpg`
-or `:add file.pdf`, `s` save, `q` quit.
+Keys: `n/p` or arrows to navigate, `g/G` first/last, `m` mark page,
+`:select 1,3-5`, `:clear`, `r/R` rotate the visible page, `M` mirror the
+visible page, `d` delete the visible page, `:move N`, `c` crop the visible
+page, `S` scan with `hp-scan`, `:add image.jpg` or `:add file.pdf`, `s` save,
+`q` quit.
 
 Running `pdfview` with no file starts an empty document. Use `S` or `:scan`
 to create a multi-page scan, or `:add` to append image/PDF pages. Image pages
