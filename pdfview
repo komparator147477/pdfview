@@ -304,7 +304,7 @@ def show(state: State, fmt: str) -> None:
             ],
             check=False,
         )
-        footer_top = "Move: n/p, g/G | Select: m, :select, :clear"
+        footer_top = "Move: n/p, g/G, o go to | Select: m, :select, :clear"
         footer_bottom = "Edit: r/R rotate, M mirror, d delete, :move, c crop | Add: S scan, :add"
         footer_undo = "Undo: u/^Z, U redo, :history, :goto N | File: s save, q quit"
         if state.message:
@@ -596,6 +596,19 @@ def command(state: State, line: str) -> None:
         state.message = f"unknown command: {line}"
 
 
+def go_to_page(state: State, raw: str) -> None:
+    if len(state.doc) == 0:
+        raise ValueError("no pages")
+    try:
+        page = int(raw)
+    except ValueError as exc:
+        raise ValueError("page number required") from exc
+    if page < 1 or page > len(state.doc):
+        raise ValueError(f"page out of range: 1-{len(state.doc)}")
+    state.page = page - 1
+    add_history(state, f"go to page {page}")
+
+
 def default_out(path: Path) -> Path:
     return path.with_name(f"{path.stem}-edited.pdf")
 
@@ -655,6 +668,8 @@ def main(argv: list[str] | None = None) -> int:
             elif c == "G":
                 if len(state.doc) > 0:
                     state.page = len(state.doc) - 1
+            elif c == "o":
+                go_to_page(state, prompt("Go to page: "))
             elif c == "m":
                 state.selected.symmetric_difference_update({state.page})
                 verb = "selected" if state.page in state.selected else "unselected"

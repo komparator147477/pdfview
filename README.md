@@ -26,6 +26,8 @@ Move:
 - `p` / left arrow: previous page
 - `g`: first page
 - `G`: last page
+- `o`: prompt for a page number
+- `:page N`: jump to page `N`
 
 Select:
 - `m`: mark or unmark the visible page
