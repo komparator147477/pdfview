@@ -292,6 +292,7 @@ def show(state: State, fmt: str) -> None:
             f"{state.path.name if state.path else 'new document'} | page {state.page + 1}/{len(state.doc)} | "
             f"selected {len(state.selected)} | {dirty} | out {state.out}"
         )
+        print("\033[2J\033[H", end="")
         print_at(1, header, cols)
         print("\033[2;1H", end="")
         subprocess.run(
