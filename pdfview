@@ -255,6 +255,16 @@ def render_page(doc: fitz.Document, page_index: int) -> Path:
     return out
 
 
+def print_at(row: int, text: str = "", cols: int | None = None) -> None:
+    if cols is not None:
+        text = text[:cols]
+    print(f"\033[{row};1H\033[2K{text}", end="")
+
+
+def clear_line(row: int) -> None:
+    print(f"\033[{row};1H\033[2K", end="")
+
+
 def show(state: State, fmt: str) -> None:
     cols, rows = shutil.get_terminal_size((100, 40))
     if len(state.doc) == 0:
@@ -274,15 +284,16 @@ def show(state: State, fmt: str) -> None:
         return
     png = render_page(state.doc, state.page)
     try:
-        footer_rows = 4 + (1 if state.history else 0) + (1 if state.show_history_tree else 0)
-        image_rows = max(5, rows - footer_rows)
+        footer_lines = 3 + (1 if state.history else 0) + (1 if state.show_history_tree else 0)
+        footer_start = max(3, rows - footer_lines + 1)
+        image_rows = max(5, footer_start - 3)
         dirty = "*" if state.dirty else "-"
         header = (
             f"{state.path.name if state.path else 'new document'} | page {state.page + 1}/{len(state.doc)} | "
             f"selected {len(state.selected)} | {dirty} | out {state.out}"
         )
-        print("\033[H\033[J", end="")
-        print(header[:cols])
+        print_at(1, header, cols)
+        print("\033[2;1H", end="")
         subprocess.run(
             [
                 "chafa",
@@ -299,13 +310,20 @@ def show(state: State, fmt: str) -> None:
         if state.message:
             footer_top = f"{state.message} || {footer_top}"
             state.message = ""
-        print(footer_top[:cols])
-        print(footer_bottom[:cols])
-        print(footer_undo[:cols], flush=True)
+        print_at(footer_start, footer_top, cols)
+        print_at(footer_start + 1, footer_bottom, cols)
+        print_at(footer_start + 2, footer_undo, cols)
+        next_line = footer_start + 3
         if state.history:
-            print(("Recent: " + " | ".join(state.history))[:cols], flush=True)
+            print_at(next_line, "Recent: " + " | ".join(state.history), cols)
+            next_line += 1
         if state.show_history_tree:
-            print(history_tree_line(state, cols), flush=True)
+            print_at(next_line, history_tree_line(state, cols), cols)
+            next_line += 1
+        while next_line <= rows:
+            clear_line(next_line)
+            next_line += 1
+        print(f"\033[{rows};1H", end="", flush=True)
     finally:
         png.unlink(missing_ok=True)
 
