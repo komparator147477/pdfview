@@ -115,6 +115,17 @@ def fit_rect(src: fitz.Rect, dst: fitz.Rect) -> fitz.Rect:
 
 
 @dataclass
+class Snapshot:
+    id: int
+    parent: int | None
+    label: str
+    data: bytes | None
+    page: int
+    selected: set[int]
+    children: list[int] = field(default_factory=list)
+
+
+@dataclass
 class State:
     path: Path | None
     doc: fitz.Document
@@ -125,6 +136,11 @@ class State:
     dirty: bool = False
     message: str = ""
     history: list[str] = field(default_factory=list)
+    snapshots: dict[int, Snapshot] = field(default_factory=dict)
+    current_snapshot: int = 0
+    saved_snapshot: int = 0
+    next_snapshot: int = 1
+    show_history_tree: bool = False
 
     def targets(self, use_selection: bool = True) -> list[int]:
         if len(self.doc) == 0:
@@ -144,6 +160,91 @@ def add_history(state: State, message: str) -> None:
     state.history = state.history[-3:]
 
 
+def doc_bytes(doc: fitz.Document) -> bytes | None:
+    if len(doc) == 0:
+        return None
+    return doc.tobytes(garbage=4, deflate=True)
+
+
+def init_snapshots(state: State) -> None:
+    state.snapshots = {
+        0: Snapshot(
+            id=0,
+            parent=None,
+            label="opened" if state.path else "empty",
+            data=doc_bytes(state.doc),
+            page=state.page,
+            selected=set(state.selected),
+        )
+    }
+    state.current_snapshot = 0
+    state.saved_snapshot = 0
+    state.next_snapshot = 1
+
+
+def record_snapshot(state: State, label: str) -> None:
+    state.dirty = True
+    add_history(state, label)
+    node_id = state.next_snapshot
+    state.next_snapshot += 1
+    state.snapshots[node_id] = Snapshot(
+        id=node_id,
+        parent=state.current_snapshot,
+        label=label,
+        data=doc_bytes(state.doc),
+        page=state.page,
+        selected=set(state.selected),
+    )
+    state.snapshots[state.current_snapshot].children.append(node_id)
+    state.current_snapshot = node_id
+
+
+def restore_snapshot(state: State, node_id: int) -> None:
+    if node_id not in state.snapshots:
+        raise ValueError(f"history node not found: {node_id}")
+    node = state.snapshots[node_id]
+    old = state.doc
+    state.doc = fitz.open("pdf", node.data) if node.data is not None else fitz.open()
+    old.close()
+    state.page = node.page
+    state.selected = set(node.selected)
+    state.clamp_page()
+    state.current_snapshot = node_id
+    state.dirty = state.current_snapshot != state.saved_snapshot
+    state.show_history_tree = True
+
+
+def undo(state: State) -> None:
+    node = state.snapshots[state.current_snapshot]
+    if node.parent is None:
+        state.message = "nothing to undo"
+        return
+    restore_snapshot(state, node.parent)
+    state.message = f"undo: {state.snapshots[state.current_snapshot].label}"
+    add_history(state, state.message)
+
+
+def redo(state: State) -> None:
+    node = state.snapshots[state.current_snapshot]
+    if not node.children:
+        state.message = "nothing to redo"
+        return
+    child_id = node.children[-1]
+    restore_snapshot(state, child_id)
+    state.message = f"redo: {state.snapshots[child_id].label}"
+    add_history(state, state.message)
+
+
+def history_tree_line(state: State, cols: int) -> str:
+    ids = sorted(state.snapshots)
+    parts = []
+    for node_id in ids[-8:]:
+        node = state.snapshots[node_id]
+        marker = "*" if node_id == state.current_snapshot else ""
+        parts.append(f"{marker}{node_id}:{node.label[:18]}")
+    return ("Tree: " + " | ".join(parts))[:cols]
+
+
 def render_page(doc: fitz.Document, page_index: int) -> Path:
     page = doc[page_index]
     pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
@@ -156,47 +257,55 @@ def render_page(doc: fitz.Document, page_index: int) -> Path:
 
 def show(state: State, fmt: str) -> None:
     cols, rows = shutil.get_terminal_size((100, 40))
-    print("\033[2J\033[H", end="")
     if len(state.doc) == 0:
+        print("\033[H\033[J", end="")
         dirty = "*" if state.dirty else "-"
         header = f"pdfview: empty document | selected 0 | {dirty} | out {state.out}"
         print(header[:cols])
-        footer = "New: S scan, :add files | File: s save, q quit"
+        footer = "New: S scan, :add files | Undo: u/^Z, U, :history, :goto N | File: s save, q quit"
         if state.message:
             footer = f"{state.message} || {footer}"
             state.message = ""
         print(footer[:cols], flush=True)
         if state.history:
             print(("Recent: " + " | ".join(state.history))[:cols], flush=True)
+        if state.show_history_tree:
+            print(history_tree_line(state, cols), flush=True)
         return
     png = render_page(state.doc, state.page)
     try:
+        footer_rows = 4 + (1 if state.history else 0) + (1 if state.show_history_tree else 0)
+        image_rows = max(5, rows - footer_rows)
         dirty = "*" if state.dirty else "-"
         header = (
             f"{state.path.name if state.path else 'new document'} | page {state.page + 1}/{len(state.doc)} | "
             f"selected {len(state.selected)} | {dirty} | out {state.out}"
         )
+        print("\033[H\033[J", end="")
         print(header[:cols])
         subprocess.run(
             [
                 "chafa",
-                "--clear",
                 "--animate=off",
                 f"--format={fmt}",
-                f"--size={cols}x{max(5, rows - 4)}",
+                f"--size={cols}x{image_rows}",
                 str(png),
             ],
             check=False,
         )
         footer_top = "Move: n/p, g/G | Select: m, :select, :clear"
-        footer_bottom = "Edit: r/R rotate, M mirror, d delete, :move, c crop | Add: S scan, :add | File: s save, q quit"
+        footer_bottom = "Edit: r/R rotate, M mirror, d delete, :move, c crop | Add: S scan, :add"
+        footer_undo = "Undo: u/^Z, U redo, :history, :goto N | File: s save, q quit"
         if state.message:
             footer_top = f"{state.message} || {footer_top}"
             state.message = ""
         print(footer_top[:cols])
-        print(footer_bottom[:cols], flush=True)
+        print(footer_bottom[:cols])
+        print(footer_undo[:cols], flush=True)
         if state.history:
             print(("Recent: " + " | ".join(state.history))[:cols], flush=True)
+        if state.show_history_tree:
+            print(history_tree_line(state, cols), flush=True)
     finally:
         png.unlink(missing_ok=True)
 
@@ -205,18 +314,24 @@ def page_list_label(pages: list[int]) -> str:
     return ", ".join(str(page + 1) for page in pages)
 
 
+def require_targets(targets: list[int]) -> None:
+    if not targets:
+        raise ValueError("no pages to edit")
+
+
 def rotate(state: State, degrees: int, use_selection: bool = True) -> None:
     targets = state.targets(use_selection)
+    require_targets(targets)
     for i in targets:
         page = state.doc[i]
         page.set_rotation((page.rotation + degrees) % 360)
-    state.dirty = True
     direction = "right" if degrees > 0 else "left"
-    add_history(state, f"rotate {direction}: page {page_list_label(targets)}")
+    record_snapshot(state, f"rotate {direction}: page {page_list_label(targets)}")
 
 
 def mirror(state: State, use_selection: bool = True) -> None:
     targets = state.targets(use_selection)
+    require_targets(targets)
     for i in targets:
         page = state.doc[i]
         rect = page.rect
@@ -225,22 +340,22 @@ def mirror(state: State, use_selection: bool = True) -> None:
         state.doc.delete_page(i)
         new_page = state.doc.new_page(pno=i, width=rect.width, height=rect.height)
         new_page.insert_image(new_page.rect, pixmap=pix)
-    state.dirty = True
-    add_history(state, f"mirror: page {page_list_label(targets)}")
+    record_snapshot(state, f"mirror: page {page_list_label(targets)}")
 
 
 def delete_pages(state: State, use_selection: bool = True) -> None:
     targets = state.targets(use_selection)
+    require_targets(targets)
     state.doc.delete_pages(targets)
     state.selected.clear()
     state.clamp_page()
-    state.dirty = True
-    add_history(state, f"delete: page {page_list_label(targets)}")
+    record_snapshot(state, f"delete: page {page_list_label(targets)}")
 
 
 def move_pages(state: State, target_page_1: int, use_selection: bool = True) -> None:
     total = len(state.doc)
     targets = state.targets(use_selection)
+    require_targets(targets)
     target = target_page_1 - 1
     if target < 0 or target > total:
         raise ValueError("target page out of range")
@@ -257,12 +372,12 @@ def move_pages(state: State, target_page_1: int, use_selection: bool = True) -> 
     state.doc = new
     state.selected.clear()
     state.page = insert_at
-    state.dirty = True
-    add_history(state, f"move page {page_list_label(targets)} before {target_page_1}")
+    record_snapshot(state, f"move page {page_list_label(targets)} before {target_page_1}")
 
 
 def crop_pages(state: State, use_selection: bool = True) -> None:
     pages = state.targets(use_selection)
+    require_targets(pages)
     margins = [0.0, 0.0, 0.0, 0.0]
     edge = 0
     names = ["left", "top", "right", "bottom"]
@@ -284,9 +399,8 @@ def crop_pages(state: State, use_selection: bool = True) -> None:
                 if nr.is_empty or nr.width < 10 or nr.height < 10:
                     raise ValueError("crop rectangle is too small")
                 page.set_cropbox(nr)
-            state.dirty = True
             state.message = "crop applied"
-            add_history(state, f"crop: page {page_list_label(pages)}")
+            record_snapshot(state, f"crop: page {page_list_label(pages)}")
             return
         elif c in ("h", "j", "k", "l", "H", "J", "K", "L"):
             amount = 25.0 if c.isupper() else step
@@ -308,17 +422,36 @@ def save(state: State, allow_existing: bool = False) -> None:
         if answer.lower() != "y":
             state.message = "save cancelled"
             return
-    state.doc.save(out, garbage=4, deflate=True)
-    state.dirty = False
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(prefix=f".{out.name}.", suffix=".pdf", dir=out.parent, delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
     if shutil.which("qpdf"):
-        result = subprocess.run(["qpdf", "--check", str(out)], capture_output=True, text=True)
-        state.message = "saved; qpdf ok" if result.returncode == 0 else "saved; qpdf check failed"
+        try:
+            state.doc.save(tmp_path, garbage=4, deflate=True)
+            result = subprocess.run(["qpdf", "--check", str(tmp_path)], capture_output=True, text=True)
+            if result.returncode != 0:
+                details = " ".join((result.stderr or result.stdout or "unknown qpdf error").split())
+                state.message = f"save failed; qpdf: {details[:120]}"
+                add_history(state, "save failed: qpdf")
+                return
+            os.replace(tmp_path, out)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        state.message = "saved; qpdf ok"
     else:
+        try:
+            state.doc.save(tmp_path, garbage=4, deflate=True)
+            os.replace(tmp_path, out)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         state.message = "saved; qpdf not found"
+    state.saved_snapshot = state.current_snapshot
+    state.dirty = False
     add_history(state, f"save: {out.name}")
 
 
-def append_pdf(state: State, path: Path) -> int:
+def append_pdf(state: State, path: Path, record: bool = True) -> int:
     before = len(state.doc)
     try:
         src = fitz.open(path)
@@ -333,13 +466,13 @@ def append_pdf(state: State, path: Path) -> int:
     finally:
         src.close()
     state.page = before
-    state.dirty = True
     state.clamp_page()
-    add_history(state, f"add PDF: {path.name}")
+    if record:
+        record_snapshot(state, f"add PDF: {path.name}")
     return len(state.doc) - before
 
 
-def append_image(state: State, path: Path) -> None:
+def append_image(state: State, path: Path, record: bool = True) -> None:
     image = None
     converted = None
     try:
@@ -357,9 +490,9 @@ def append_image(state: State, path: Path) -> None:
         if image is not None:
             image.close()
     state.page = len(state.doc) - 1
-    state.dirty = True
     state.clamp_page()
-    add_history(state, f"add image: {path.name}")
+    if record:
+        record_snapshot(state, f"add image: {path.name}")
 
 
 def add_files(state: State, paths: list[str]) -> None:
@@ -373,11 +506,13 @@ def add_files(state: State, paths: list[str]) -> None:
         if not path.is_file():
             raise ValueError(f"not a file: {raw}")
         if path.suffix.lower() in IMAGE_EXTENSIONS:
-            append_image(state, path)
+            append_image(state, path, record=False)
             added += 1
         else:
-            added += append_pdf(state, path)
+            added += append_pdf(state, path, record=False)
     state.message = f"added {added} page{'s' if added != 1 else ''}"
+    if added:
+        record_snapshot(state, f"add: {added} page{'s' if added != 1 else ''}")
 
 
 def scan_pages(state: State) -> None:
@@ -389,10 +524,18 @@ def scan_pages(state: State) -> None:
         tmp_path = Path(tmp.name)
         tmp.close()
         try:
-            result = subprocess.run(["hp-scan", "--dest=file", "--filetype=pdf", "-o", str(tmp_path)], check=False)
+            result = subprocess.run(
+                ["hp-scan", "--dest=file", "--filetype=pdf", "-o", str(tmp_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
             if result.returncode != 0:
-                raise ValueError(f"hp-scan failed with exit code {result.returncode}")
-            total += append_pdf(state, tmp_path)
+                details = " ".join((result.stderr or result.stdout or "no scanner details").split())
+                raise ValueError(f"hp-scan failed ({result.returncode}): {details[:160]}")
+            if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+                raise ValueError("hp-scan finished but did not create a PDF")
+            total += append_pdf(state, tmp_path, record=False)
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -400,7 +543,8 @@ def scan_pages(state: State) -> None:
         if again.lower() != "y":
             break
     state.message = f"scanned {total} page{'s' if total != 1 else ''}"
-    add_history(state, f"scan: {total} page{'s' if total != 1 else ''}")
+    if total:
+        record_snapshot(state, f"scan: {total} page{'s' if total != 1 else ''}")
 
 
 def command(state: State, line: str) -> None:
@@ -423,6 +567,13 @@ def command(state: State, line: str) -> None:
         scan_pages(state)
     elif cmd == "add":
         add_files(state, parts[1:])
+    elif cmd == "history":
+        state.show_history_tree = not state.show_history_tree
+        state.message = "history tree shown" if state.show_history_tree else "history tree hidden"
+    elif cmd == "goto" and len(parts) == 2:
+        restore_snapshot(state, int(parts[1]))
+        state.message = f"history: moved to {state.current_snapshot}"
+        add_history(state, state.message)
     else:
         state.message = f"unknown command: {line}"
 
@@ -460,6 +611,7 @@ def main(argv: list[str] | None = None) -> int:
     out = path if args.overwrite and path else (args.out.resolve() if args.out else (default_out(path) if path else Path("scan.pdf").resolve()))
     state = State(path=path, doc=doc, out=out, overwrite=args.overwrite, page=args.page - 1)
     state.clamp_page()
+    init_snapshots(state)
     fmt = args.format or chafa_format()
 
     while True:
@@ -501,6 +653,10 @@ def main(argv: list[str] | None = None) -> int:
                 crop_pages(state, use_selection=False)
             elif c == "S":
                 scan_pages(state)
+            elif c in ("u", "\x1a"):
+                undo(state)
+            elif c == "U":
+                redo(state)
             elif c == "s":
                 save(state)
             elif c == ":":
