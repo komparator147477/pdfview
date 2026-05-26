@@ -156,9 +156,9 @@ def show(state: State, fmt: str) -> None:
         dirty = "*" if state.dirty else "-"
         header = f"pdfview: empty document | selected 0 | {dirty} | out {state.out}"
         print(header[:cols])
-        footer = "S scan | :scan | :add image... | s save | q quit"
+        footer = "New: S scan, :add files | File: s save, q quit"
         if state.message:
-            footer = f"{state.message} | {footer}"
+            footer = f"{state.message} || {footer}"
             state.message = ""
         print(footer[:cols], flush=True)
         return
@@ -181,11 +181,13 @@ def show(state: State, fmt: str) -> None:
             ],
             check=False,
         )
-        footer = "n/p g/G +/-/0 m :select :clear r/R M d :move c S :scan :add s q"
+        footer_top = "Move: n/p, g/G | View: +/-/0 | Select: m, :select, :clear"
+        footer_bottom = "Edit: r/R rotate, M mirror, d delete, :move, c crop | Add: S scan, :add | File: s save, q quit"
         if state.message:
-            footer = f"{state.message} | {footer}"
+            footer_top = f"{state.message} || {footer_top}"
             state.message = ""
-        print(footer[:cols], flush=True)
+        print(footer_top[:cols])
+        print(footer_bottom[:cols], flush=True)
     finally:
         png.unlink(missing_ok=True)
 
