@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
 import shlex
 import shutil
 import subprocess
@@ -70,8 +71,19 @@ def read_key() -> str:
         tty.setraw(fd)
         c = sys.stdin.read(1)
         if c == "\x1b":
-            extra = sys.stdin.read(2)
-            return c + extra if extra else c
+            seq = c
+            while True:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.01)
+                if not ready:
+                    break
+                seq += sys.stdin.read(1)
+                if len(seq) > 32:
+                    break
+                if seq.startswith("\x1b[<") and seq.endswith(("M", "m")):
+                    break
+                if len(seq) >= 3 and seq.startswith("\x1b[") and seq[-1].isalpha():
+                    break
+            return seq
         return c
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -243,6 +255,23 @@ def history_tree_line(state: State, cols: int) -> str:
         marker = "*" if node_id == state.current_snapshot else ""
         parts.append(f"{marker}{node_id}:{node.label[:18]}")
     return ("Tree: " + " | ".join(parts))[:cols]
+
+
+def normalize_key(c: str) -> str:
+    if c in ("\x1b[A", "\x1bOA"):
+        return "wheel-up"
+    if c in ("\x1b[B", "\x1bOB"):
+        return "wheel-down"
+    if c.startswith("\x1b[<") and c.endswith(("M", "m")):
+        parts = c[3:-1].split(";")
+        if parts and parts[0].isdigit():
+            button = int(parts[0])
+            if button in (64, 68):
+                return "wheel-up"
+            if button in (65, 69):
+                return "wheel-down"
+        return "ignore"
+    return c
 
 
 def render_page(doc: fitz.Document, page_index: int) -> Path:
@@ -648,13 +677,13 @@ def main(argv: list[str] | None = None) -> int:
 
     use_alt_screen = sys.stdin.isatty() and sys.stdout.isatty()
     if use_alt_screen:
-        print("\033[?1049h\033[?25l", end="", flush=True)
+        print("\033[?1049h\033[?1000h\033[?1006h\033[?25l", end="", flush=True)
     try:
         while True:
             if len(state.doc) > 0 and not shutil.which("chafa"):
                 die("chafa is required; install it with your system package manager")
             show(state, fmt)
-            c = read_key()
+            c = normalize_key(read_key())
             try:
                 if c in ("q", "\x03", "\x1b"):
                     if state.dirty:
@@ -662,10 +691,10 @@ def main(argv: list[str] | None = None) -> int:
                         if answer.lower() != "y":
                             continue
                     return 0
-                if c in ("n", " ", "\x1b[C"):
+                if c in ("n", " ", "\x1b[C", "wheel-down"):
                     if len(state.doc) > 0:
                         state.page = min(len(state.doc) - 1, state.page + 1)
-                elif c in ("p", "\x1b[D"):
+                elif c in ("p", "\x1b[D", "wheel-up"):
                     state.page = max(0, state.page - 1)
                 elif c == "g":
                     state.page = 0
@@ -702,7 +731,7 @@ def main(argv: list[str] | None = None) -> int:
                 state.message = str(exc)
     finally:
         if use_alt_screen:
-            print("\033[?25h\033[?1049l", end="", flush=True)
+            print("\033[?25h\033[?1006l\033[?1000l\033[?1049l", end="", flush=True)
 
 
 if __name__ == "__main__":

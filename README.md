@@ -24,6 +24,7 @@ pdfview() {
 Move:
 - `n` / right arrow / space: next page
 - `p` / left arrow: previous page
+- mouse wheel down/up: next/previous page
 - `g`: first page
 - `G`: last page
 - `o`: prompt for a page number
