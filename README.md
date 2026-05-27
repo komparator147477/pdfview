@@ -10,13 +10,16 @@ pdfview file.pdf --out cleaned.pdf
 pdfview file.pdf --overwrite
 ```
 
-Requires `uv`, `PyMuPDF` through the script metadata, and `chafa` on the system.
-Install through `~/.zshrc`:
+This version is a Rust CLI with native Poppler/Cairo page rendering and direct
+Kitty/Ghostty image output. Required tools: `qpdf` and `pdfinfo`. Optional
+workflow tools: `magick` for image import and `PDFVIEW_SCAN_COMMAND` for
+scanner integration.
 
-```zsh
-pdfview() {
-    uv run --script ~/coding/pdfview/pdfview "$@"
-}
+Build and install locally:
+
+```bash
+cargo build --release
+~/.zshrc: pdfview() { ~/coding/pdfview/target/release/pdfview "$@"; }
 ```
 
 ## Controls
@@ -33,6 +36,9 @@ Move:
 Select:
 - `m`: mark or unmark the visible page
 - `:select 1,3-5`: replace the current selection with pages 1, 3, 4, 5
+- `:select all`: select every page
+- `:unselect 4-7`: remove pages 4 through 7 from the selection
+- `:unselect all`: clear the selection
 - `:clear`: clear the selection
 
 Edit:
@@ -42,47 +48,38 @@ Edit:
 - `d`: delete the visible page
 - `:move N`: move the selected pages, or the visible page if nothing is selected, before page `N`
 - `c`: crop the visible page
+- `:compress screen|medium|print`: raster-compress selected pages, or the visible page
 
 Add:
-- `S` or `:scan`: scan pages with `hp-scan`
+- `S` or `:scan [DPI]`: scan pages with `PDFVIEW_SCAN_COMMAND`
 - `:add image.jpg file.pdf`: append images or PDFs
 
 History:
 - `u` or `Ctrl-Z`: undo one edit
 - `U`: redo into the newest child edit
-- `:history`: show or hide the compact history tree
+- `:tree` or `:history`: show or hide the full history tree
 - `:goto N`: jump to a history node by number
+
+Help:
+- `:help`: show command and keybinding reference in the page area
 
 File:
 - `s`: save
 - `q`: quit
 
 Running `pdfview` with no file starts an empty document. Use `S` or `:scan`
-to create a multi-page scan, or `:add` to append image/PDF pages. Image pages
-are placed on A4 with their aspect ratio preserved.
+to create a multi-page scan, or `:add` to append image/PDF pages.
 
-## Selection
+## Notes
 
-Most single-key edits work on the visible page, so pressing `R` on page 2 edits
-page 2 even if another page is selected. Selection is mainly for commands that
-naturally work on a group, such as `:move N`.
+Rotate, delete, move, append, and save are structural PDF operations through
+`qpdf`. Crop and mirror rasterize affected pages, which matches the scanned
+document cleanup use case.
 
-Use `m` when you want to mark pages while browsing. Use `:select 1,3-5` when
-you already know the page numbers. The header always shows how many pages are
-selected.
+Scanning runs a shell command that receives the output PDF path as `$1` and
+optional DPI as `$2`.
+Override it with `PDFVIEW_SCAN_COMMAND`; by default pdfview runs:
 
-## Crop
-
-Press `c` to enter crop mode for the visible page.
-
-- `h`: move the left crop edge inward
-- `l`: move the right crop edge inward
-- `k`: move the top crop edge inward
-- `j`: move the bottom crop edge inward
-- Uppercase `H/L/K/J`: larger steps
-- `Tab`: cycle the active edge shown in the status line
-- `-`: reduce the active edge margin
-- `Enter`: apply the crop
-- `Esc` or `q`: cancel
-
-Cropping changes the PDF crop box. It does not rasterize the page.
+```bash
+source ~/coding/hpscan/hpscan.zsh && hpscan "$1" "$2"
+```
