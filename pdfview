@@ -292,25 +292,14 @@ def show(state: State, fmt: str) -> None:
             f"{state.path.name if state.path else 'new document'} | page {state.page + 1}/{len(state.doc)} | "
             f"selected {len(state.selected)} | {dirty} | out {state.out}"
         )
-        print("\033[2J\033[H", end="")
-        print_at(1, header, cols)
-        print("\033[2;1H", end="")
-        subprocess.run(
-            [
-                "chafa",
-                "--animate=off",
-                f"--format={fmt}",
-                f"--size={cols}x{image_rows}",
-                str(png),
-            ],
-            check=False,
-        )
         footer_top = "Move: n/p, g/G, o go to | Select: m, :select, :clear"
         footer_bottom = "Edit: r/R rotate, M mirror, d delete, :move, c crop | Add: S scan, :add"
         footer_undo = "Undo: u/^Z, U redo, :history, :goto N | File: s save, q quit"
         if state.message:
             footer_top = f"{state.message} || {footer_top}"
             state.message = ""
+        print("\033[2J\033[H", end="")
+        print_at(1, header, cols)
         print_at(footer_start, footer_top, cols)
         print_at(footer_start + 1, footer_bottom, cols)
         print_at(footer_start + 2, footer_undo, cols)
@@ -324,7 +313,18 @@ def show(state: State, fmt: str) -> None:
         while next_line <= rows:
             clear_line(next_line)
             next_line += 1
-        print(f"\033[{rows};1H", end="", flush=True)
+        print("\033[2;1H", end="")
+        subprocess.run(
+            [
+                "chafa",
+                "--animate=off",
+                f"--format={fmt}",
+                f"--size={cols}x{image_rows}",
+                str(png),
+            ],
+            check=False,
+        )
+        print("", end="", flush=True)
     finally:
         png.unlink(missing_ok=True)
 
@@ -646,57 +646,63 @@ def main(argv: list[str] | None = None) -> int:
     init_snapshots(state)
     fmt = args.format or chafa_format()
 
-    while True:
-        if len(state.doc) > 0 and not shutil.which("chafa"):
-            die("chafa is required; install it with your system package manager")
-        show(state, fmt)
-        c = read_key()
-        try:
-            if c in ("q", "\x03", "\x1b"):
-                if state.dirty:
-                    answer = prompt("Unsaved changes. Quit anyway? [y/N] ")
-                    if answer.lower() != "y":
-                        continue
-                print("\033[2J\033[H", end="")
-                return 0
-            if c in ("n", " ", "\x1b[C"):
-                if len(state.doc) > 0:
-                    state.page = min(len(state.doc) - 1, state.page + 1)
-            elif c in ("p", "\x1b[D"):
-                state.page = max(0, state.page - 1)
-            elif c == "g":
-                state.page = 0
-            elif c == "G":
-                if len(state.doc) > 0:
-                    state.page = len(state.doc) - 1
-            elif c == "o":
-                go_to_page(state, prompt("Go to page: "))
-            elif c == "m":
-                state.selected.symmetric_difference_update({state.page})
-                verb = "selected" if state.page in state.selected else "unselected"
-                add_history(state, f"{verb}: page {state.page + 1}")
-            elif c == "r":
-                rotate(state, 90, use_selection=False)
-            elif c == "R":
-                rotate(state, -90, use_selection=False)
-            elif c == "M":
-                mirror(state, use_selection=False)
-            elif c == "d":
-                delete_pages(state, use_selection=False)
-            elif c == "c":
-                crop_pages(state, use_selection=False)
-            elif c == "S":
-                scan_pages(state)
-            elif c in ("u", "\x1a"):
-                undo(state)
-            elif c == "U":
-                redo(state)
-            elif c == "s":
-                save(state)
-            elif c == ":":
-                command(state, prompt(":"))
-        except Exception as exc:
-            state.message = str(exc)
+    use_alt_screen = sys.stdin.isatty() and sys.stdout.isatty()
+    if use_alt_screen:
+        print("\033[?1049h\033[?25l", end="", flush=True)
+    try:
+        while True:
+            if len(state.doc) > 0 and not shutil.which("chafa"):
+                die("chafa is required; install it with your system package manager")
+            show(state, fmt)
+            c = read_key()
+            try:
+                if c in ("q", "\x03", "\x1b"):
+                    if state.dirty:
+                        answer = prompt("Unsaved changes. Quit anyway? [y/N] ")
+                        if answer.lower() != "y":
+                            continue
+                    return 0
+                if c in ("n", " ", "\x1b[C"):
+                    if len(state.doc) > 0:
+                        state.page = min(len(state.doc) - 1, state.page + 1)
+                elif c in ("p", "\x1b[D"):
+                    state.page = max(0, state.page - 1)
+                elif c == "g":
+                    state.page = 0
+                elif c == "G":
+                    if len(state.doc) > 0:
+                        state.page = len(state.doc) - 1
+                elif c == "o":
+                    go_to_page(state, prompt("Go to page: "))
+                elif c == "m":
+                    state.selected.symmetric_difference_update({state.page})
+                    verb = "selected" if state.page in state.selected else "unselected"
+                    add_history(state, f"{verb}: page {state.page + 1}")
+                elif c == "r":
+                    rotate(state, 90, use_selection=False)
+                elif c == "R":
+                    rotate(state, -90, use_selection=False)
+                elif c == "M":
+                    mirror(state, use_selection=False)
+                elif c == "d":
+                    delete_pages(state, use_selection=False)
+                elif c == "c":
+                    crop_pages(state, use_selection=False)
+                elif c == "S":
+                    scan_pages(state)
+                elif c in ("u", "\x1a"):
+                    undo(state)
+                elif c == "U":
+                    redo(state)
+                elif c == "s":
+                    save(state)
+                elif c == ":":
+                    command(state, prompt(":"))
+            except Exception as exc:
+                state.message = str(exc)
+    finally:
+        if use_alt_screen:
+            print("\033[?25h\033[?1049l", end="", flush=True)
 
 
 if __name__ == "__main__":
