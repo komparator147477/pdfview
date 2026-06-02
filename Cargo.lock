@@ -405,6 +405,7 @@ dependencies = [
  "clap",
  "crossterm",
  "predicates",
+ "serde_json",
  "shell-words",
  "tempfile",
 ]

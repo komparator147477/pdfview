@@ -11,13 +11,18 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use serde_json::Value;
 use tempfile::{Builder, TempDir};
 
-const A4_SIZE: &str = "595x842";
+const IMAGE_IMPORT_DPI: &str = "300";
+const RASTER_EDIT_DPI: f64 = 300.0;
 const IMAGE_EXTENSIONS: &[&str] = &[
     "bmp", "gif", "jfif", "jp2", "jpe", "jpeg", "jpg", "jpx", "pam", "pbm", "pgm", "png", "pnm",
     "ppm", "psd", "tif", "tiff", "webp",
@@ -58,8 +63,26 @@ extern "C" {
     fn cairo_scale(cairo: *mut c_void, sx: c_double, sy: c_double);
     fn cairo_set_source_rgb(cairo: *mut c_void, r: c_double, g: c_double, b: c_double);
     fn cairo_paint(cairo: *mut c_void);
-    fn cairo_pdf_surface_create(filename: *const c_char, width: c_double, height: c_double) -> *mut c_void;
+    fn cairo_pdf_surface_create(
+        filename: *const c_char,
+        width: c_double,
+        height: c_double,
+    ) -> *mut c_void;
     fn cairo_set_source_surface(cairo: *mut c_void, surface: *mut c_void, x: c_double, y: c_double);
+}
+
+#[derive(Clone, Copy)]
+struct PageSize {
+    width: f64,
+    height: f64,
+}
+
+#[derive(Clone, Copy)]
+struct PageBox {
+    left: f64,
+    bottom: f64,
+    right: f64,
+    top: f64,
 }
 
 #[derive(Parser, Debug)]
@@ -102,7 +125,9 @@ struct State {
     saved_snapshot: usize,
     next_snapshot: usize,
     show_tree_page: bool,
+    tree_cursor: usize,
     show_help_page: bool,
+    listing_page: Option<ListingPage>,
     crop_preview: Option<CropPreview>,
     render_cache: Arc<Mutex<HashMap<RenderKey, Vec<u8>>>>,
     pending_renders: Arc<Mutex<HashSet<RenderKey>>>,
@@ -120,6 +145,36 @@ struct RenderKey {
     format: String,
 }
 
+#[derive(Clone)]
+struct RenderRequest {
+    key: RenderKey,
+    pdf: PathBuf,
+    page: usize,
+    cols: u16,
+    rows: u16,
+    format: String,
+}
+
+struct ListingPage {
+    title: String,
+    entries: Vec<ListingEntry>,
+    selected: usize,
+    marked: BTreeSet<usize>,
+}
+
+struct ListingEntry {
+    label: String,
+    path: PathBuf,
+    kind: ListingEntryKind,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ListingEntryKind {
+    Directory,
+    File,
+    Empty,
+}
+
 impl State {
     fn new(args: Args, temp: TempDir) -> Result<Self> {
         let original = match args.pdf {
@@ -135,7 +190,7 @@ impl State {
                 .clone()
                 .ok_or_else(|| anyhow!("--overwrite requires an input PDF"))?
         } else if let Some(out) = args.out {
-            expand_path(out)?
+            pdf_output_path(expand_path(out)?)?
         } else if let Some(path) = &original {
             path.with_file_name(format!(
                 "{}-edited.pdf",
@@ -179,7 +234,9 @@ impl State {
             saved_snapshot: 0,
             next_snapshot: 1,
             show_tree_page: false,
+            tree_cursor: 0,
             show_help_page: false,
+            listing_page: None,
             crop_preview: None,
             render_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_renders: Arc::new(Mutex::new(HashSet::new())),
@@ -353,6 +410,8 @@ enum Input {
     Right,
     Up,
     Down,
+    WheelUp,
+    WheelDown,
     Backspace,
     Unknown,
 }
@@ -365,7 +424,7 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         if io::stdin().is_terminal() && io::stdout().is_terminal() {
             terminal::enable_raw_mode()?;
-            execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
             Ok(Self { active: true })
         } else {
             Ok(Self { active: false })
@@ -405,6 +464,7 @@ impl Drop for TerminalGuard {
             let _ = execute!(
                 io::stdout(),
                 Clear(ClearType::All),
+                DisableMouseCapture,
                 Show,
                 LeaveAlternateScreen
             );
@@ -462,23 +522,35 @@ fn handle_navigation_input(state: &mut State, input: Input) -> bool {
     if state.crop_preview.is_some() {
         return false;
     }
-    if (state.show_tree_page || state.show_help_page) && matches!(
-        input,
-        Input::Char('n') | Input::Char(' ') | Input::Right | Input::Char('p') | Input::Left | Input::Char('g') | Input::Char('G')
-    ) {
+    if state.listing_page.is_some() {
+        return false;
+    }
+    if (state.show_tree_page || state.show_help_page || state.listing_page.is_some())
+        && matches!(
+            input,
+            Input::Char('n')
+                | Input::Char(' ')
+                | Input::Right
+                | Input::Char('p')
+                | Input::Left
+                | Input::Char('g')
+                | Input::Char('G')
+        )
+    {
         state.show_tree_page = false;
         state.show_help_page = false;
+        state.listing_page = None;
         return true;
     }
     let old_page = state.page;
     match input {
         Input::Up | Input::Down => return false,
-        Input::Char('n') | Input::Char(' ') | Input::Right => {
+        Input::Char('n') | Input::Char(' ') | Input::Right | Input::WheelDown => {
             if state.page_count > 0 {
                 state.page = (state.page + 1).min(state.page_count - 1);
             }
         }
-        Input::Char('p') | Input::Left => {
+        Input::Char('p') | Input::Left | Input::WheelUp => {
             state.page = state.page.saturating_sub(1);
         }
         Input::Char('g') => state.page = 0,
@@ -493,15 +565,22 @@ fn handle_navigation_input(state: &mut State, input: Input) -> bool {
 }
 
 fn handle_action_input(state: &mut State, fmt: &str, input: Input) -> Result<UiAction> {
+    if state.listing_page.is_some() {
+        return handle_listing_input(state, fmt, input);
+    }
+    if state.show_tree_page {
+        return handle_tree_input(state, fmt, input);
+    }
     match input {
-        Input::Esc if state.show_tree_page || state.show_help_page => {
+        Input::Esc
+            if state.show_tree_page || state.show_help_page || state.listing_page.is_some() =>
+        {
             state.show_tree_page = false;
             state.show_help_page = false;
+            state.listing_page = None;
             Ok(UiAction::Redraw)
         }
-        Input::CtrlC | Input::Esc | Input::Char('q') | Input::Char('x') => {
-            Ok(UiAction::Quit)
-        }
+        Input::CtrlC | Input::Esc | Input::Char('q') | Input::Char('x') => Ok(UiAction::Quit),
         Input::Char('o') => {
             let result = go_to_page_prompt(state);
             handle_result(state, result);
@@ -583,8 +662,86 @@ fn handle_action_input(state: &mut State, fmt: &str, input: Input) -> Result<UiA
     }
 }
 
+fn handle_listing_input(state: &mut State, fmt: &str, input: Input) -> Result<UiAction> {
+    match input {
+        Input::Esc | Input::Char('q') => {
+            state.listing_page = None;
+            Ok(UiAction::Redraw)
+        }
+        Input::Up | Input::Char('k') | Input::WheelUp => {
+            if let Some(listing) = &mut state.listing_page {
+                listing.selected = listing.selected.saturating_sub(1);
+            }
+            Ok(UiAction::Redraw)
+        }
+        Input::Down | Input::Char('j') | Input::WheelDown => {
+            if let Some(listing) = &mut state.listing_page {
+                listing.selected =
+                    (listing.selected + 1).min(listing.entries.len().saturating_sub(1));
+            }
+            Ok(UiAction::Redraw)
+        }
+        Input::Char(' ') | Input::Char('m') => {
+            if let Some(listing) = &mut state.listing_page {
+                if listing
+                    .entries
+                    .get(listing.selected)
+                    .is_some_and(|entry| entry.kind == ListingEntryKind::File)
+                {
+                    if !listing.marked.insert(listing.selected) {
+                        listing.marked.remove(&listing.selected);
+                    }
+                }
+            }
+            Ok(UiAction::Redraw)
+        }
+        Input::Enter => {
+            let result = activate_listing_selection(state);
+            handle_result(state, result);
+            Ok(UiAction::Redraw)
+        }
+        Input::Char(':') => {
+            let line = prompt(":")?;
+            let result = command_line(state, fmt, &line);
+            handle_result(state, result);
+            Ok(UiAction::Redraw)
+        }
+        _ => Ok(UiAction::Noop),
+    }
+}
+
+fn handle_tree_input(state: &mut State, fmt: &str, input: Input) -> Result<UiAction> {
+    match input {
+        Input::Esc | Input::Char('q') => {
+            state.show_tree_page = false;
+            Ok(UiAction::Redraw)
+        }
+        Input::Up | Input::Char('k') | Input::WheelUp => {
+            state.tree_cursor = state.tree_cursor.saturating_sub(1);
+            Ok(UiAction::Redraw)
+        }
+        Input::Down | Input::Char('j') | Input::WheelDown => {
+            let max = tree_lines(state).len().saturating_sub(1);
+            state.tree_cursor = (state.tree_cursor + 1).min(max);
+            Ok(UiAction::Redraw)
+        }
+        Input::Enter => {
+            let result = activate_tree_selection(state);
+            handle_result(state, result);
+            Ok(UiAction::Redraw)
+        }
+        Input::Char(':') => {
+            let line = prompt(":")?;
+            let result = command_line(state, fmt, &line);
+            handle_result(state, result);
+            Ok(UiAction::Redraw)
+        }
+        _ => Ok(UiAction::Noop),
+    }
+}
+
 fn current_page_render_is_ready(state: &State, fmt: &str) -> bool {
-    if state.show_tree_page || state.show_help_page {
+    if state.show_tree_page || state.show_help_page || state.listing_page.is_some() {
         return false;
     }
     let (cols, rows) = terminal::size().unwrap_or((100, 40));
@@ -667,7 +824,11 @@ fn read_input() -> Result<Input> {
                     code: KeyCode::Backspace,
                     ..
                 }) => Ok(Input::Backspace),
-                Event::Mouse(_) => Ok(Input::Unknown),
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollDown => Ok(Input::WheelDown),
+                    MouseEventKind::ScrollUp => Ok(Input::WheelUp),
+                    _ => Ok(Input::Unknown),
+                },
                 _ => Ok(Input::Unknown),
             };
         }
@@ -678,7 +839,11 @@ fn show(state: &mut State, fmt: &str) -> Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((100, 40));
     let dirty = if state.dirty { "*" } else { "-" };
     if state.page_count == 0 {
+        let footer_lines = 2 + usize::from(!state.history.is_empty());
+        let footer_start = rows.saturating_sub(footer_lines as u16).max(3);
+        let page_rows = footer_start.saturating_sub(1).max(1);
         begin_sync_update()?;
+        clear_terminal_images(fmt)?;
         execute!(io::stdout(), MoveTo(0, 0), Clear(ClearType::All))?;
         print!(
             "{}",
@@ -690,12 +855,22 @@ fn show(state: &mut State, fmt: &str) -> Result<()> {
                 cols
             )
         );
-        print_footer(
-            state,
-            cols,
-            rows,
-            "New: S scan, :add files | Help: :help | Undo: u/^Z, U, :tree, :goto N | File: s save, q quit",
-        )?;
+        execute!(io::stdout(), MoveTo(0, 1))?;
+        if state.show_tree_page {
+            print_tree_page(state, cols, page_rows)?;
+        } else if state.show_help_page {
+            print_help_page(cols, page_rows)?;
+        } else if let Some(listing) = &state.listing_page {
+            print_listing_page(listing, cols, page_rows)?;
+        }
+        let footer = if state.listing_page.is_some() {
+            "List: Up/Down move, Space mark, Enter add/open, Esc close | :add FILE still works"
+        } else if state.show_tree_page {
+            "Tree: Up/Down move, Enter restore, Esc close | :goto N still works"
+        } else {
+            "New: S scan, :add files, :ls files | Help: :help | Undo: u/^Z, U, :tree, :goto N | File: s save, q quit"
+        };
+        print_footer(state, cols, rows, footer)?;
         end_sync_update()?;
         return Ok(());
     }
@@ -703,7 +878,7 @@ fn show(state: &mut State, fmt: &str) -> Result<()> {
     let footer_lines = 3 + usize::from(!state.history.is_empty());
     let footer_start = rows.saturating_sub(footer_lines as u16).max(3);
     let image_rows = footer_start.saturating_sub(2).max(5);
-    let rendered = if state.show_tree_page || state.show_help_page {
+    let rendered = if state.show_tree_page || state.show_help_page || state.listing_page.is_some() {
         Vec::new()
     } else {
         rendered_page_output(state, fmt, cols, image_rows)?
@@ -723,16 +898,24 @@ fn show(state: &mut State, fmt: &str) -> Result<()> {
         print_crop_controls(state, preview, footer_start, cols)?;
         print_history(state, footer_start + 2, cols, rows)?;
     } else {
-        let status = take_message(
-            state,
-            "Move: n/p, g/G, o go to | Select: m toggle/unselect, :select, :unselect, :clear",
-        );
+        let default_status = if state.listing_page.is_some() {
+            "List: Up/Down move, Space mark, Enter add/open, Esc close | :add FILE still works"
+        } else if state.show_tree_page {
+            "Tree: Up/Down move, Enter restore, Esc close | :goto N still works"
+        } else {
+            "Move: n/p, g/G, o go to | Select: m toggle/unselect, :select, :unselect, :clear"
+        };
+        let status = take_message(state, default_status);
         print_status_line(footer_start, &status, cols)?;
         print_legend_line(
             footer_start + 1,
             cols,
             &[
-            ("Edit", "r/R rotate, M mirror, d delete, :move, c crop, :compress", Color::Yellow),
+                (
+                    "Edit",
+                    "r/R rotate, M mirror, d delete, :move, c crop, :compress",
+                    Color::Yellow,
+                ),
                 ("Order", "</> move pages", Color::Blue),
                 ("Add", "S scan, :add", Color::Green),
             ],
@@ -753,6 +936,8 @@ fn show(state: &mut State, fmt: &str) -> Result<()> {
         print_tree_page(state, cols, image_rows)?;
     } else if state.show_help_page {
         print_help_page(cols, image_rows)?;
+    } else if let Some(listing) = &state.listing_page {
+        print_listing_page(listing, cols, image_rows)?;
     } else {
         io::stdout().write_all(&rendered)?;
     }
@@ -790,11 +975,7 @@ fn print_status_line(row: u16, text: &str, cols: u16) -> Result<()> {
     Ok(())
 }
 
-fn print_legend_line(
-    row: u16,
-    cols: u16,
-    groups: &[(&str, &str, Color)],
-) -> Result<()> {
+fn print_legend_line(row: u16, cols: u16, groups: &[(&str, &str, Color)]) -> Result<()> {
     execute!(io::stdout(), MoveTo(0, row))?;
     for (idx, (label, body, color)) in groups.iter().enumerate() {
         if idx > 0 {
@@ -811,10 +992,7 @@ fn print_legend_line(
 
 fn print_crop_controls(state: &mut State, preview: CropPreview, row: u16, cols: u16) -> Result<()> {
     let names = ["left", "top", "right", "bottom"];
-    let status = take_message(
-        state,
-        "Crop: arrows/hjkl +5, HJKL +50, -5, _ -50, Tab edge",
-    );
+    let status = take_message(state, "Crop: arrows/hjkl +5, HJKL +50, -5, _ -50, Tab edge");
     print_status_line(row, &status, cols)?;
     execute!(io::stdout(), MoveTo(0, row + 1))?;
     print_colored_segment("Crop", Color::Yellow, cols)?;
@@ -828,11 +1006,7 @@ fn print_crop_controls(state: &mut State, preview: CropPreview, row: u16, cols: 
         } else {
             Color::White
         };
-        print_colored_segment(
-            &format!("{name} {}", preview.margins[idx]),
-            color,
-            cols,
-        )?;
+        print_colored_segment(&format!("{name} {}", preview.margins[idx]), color, cols)?;
     }
     execute!(io::stdout(), ResetColor)?;
     clear_to_end_of_line(cols)?;
@@ -860,7 +1034,11 @@ fn print_header(state: &State, title: &str, dirty: &str, cols: u16) -> Result<()
     print_colored_segment(" | ", Color::DarkGrey, cols)?;
     print_colored_segment(
         &page_label,
-        if selected_here { Color::Yellow } else { Color::White },
+        if selected_here {
+            Color::Yellow
+        } else {
+            Color::White
+        },
         cols,
     )?;
     print_colored_segment(" | ", Color::DarkGrey, cols)?;
@@ -876,7 +1054,11 @@ fn print_header(state: &State, title: &str, dirty: &str, cols: u16) -> Result<()
     print_colored_segment(" | ", Color::DarkGrey, cols)?;
     print_colored_segment(
         dirty,
-        if state.dirty { Color::Red } else { Color::DarkGrey },
+        if state.dirty {
+            Color::Red
+        } else {
+            Color::DarkGrey
+        },
         cols,
     )?;
     print_colored_segment(" | out ", Color::DarkGrey, cols)?;
@@ -936,30 +1118,57 @@ fn history_label(item: &str) -> String {
     if item.chars().count() <= max {
         item.to_string()
     } else {
-        format!("{}...", item.chars().take(max.saturating_sub(3)).collect::<String>())
+        format!(
+            "{}...",
+            item.chars().take(max.saturating_sub(3)).collect::<String>()
+        )
     }
 }
 
 fn print_tree_page(state: &State, cols: u16, rows: u16) -> Result<()> {
-    let mut lines = Vec::new();
-    build_tree_lines(state, 0, String::new(), true, &mut lines);
+    let lines = tree_lines(state);
     for row in 0..rows {
         execute!(io::stdout(), MoveTo(0, row + 1))?;
         if let Some((id, line)) = lines.get(row as usize) {
-            let color = if *id == state.current_snapshot {
+            let selected = row as usize == state.tree_cursor;
+            let marker = if selected { "> " } else { "  " };
+            let color = if selected {
+                Color::Yellow
+            } else if *id == state.current_snapshot {
                 Color::Yellow
             } else if *id == state.saved_snapshot {
                 Color::Green
             } else {
                 Color::White
             };
-            print_colored_segment(line, color, cols)?;
+            print_colored_segment(&format!("{marker}{line}"), color, cols)?;
             execute!(io::stdout(), ResetColor)?;
             clear_to_end_of_line(cols)?;
         } else {
             print!("{}", " ".repeat(cols as usize));
         }
     }
+    Ok(())
+}
+
+fn tree_lines(state: &State) -> Vec<(usize, String)> {
+    let mut lines = Vec::new();
+    build_tree_lines(state, 0, String::new(), true, &mut lines);
+    lines
+}
+
+fn activate_tree_selection(state: &mut State) -> Result<()> {
+    let lines = tree_lines(state);
+    let Some((id, _)) = lines.get(state.tree_cursor) else {
+        return Ok(());
+    };
+    state.restore_snapshot(*id)?;
+    state.tree_cursor = tree_lines(state)
+        .iter()
+        .position(|(line_id, _)| *line_id == *id)
+        .unwrap_or(0);
+    state.message = format!("history: moved to {id}");
+    state.add_history(state.message.clone());
     Ok(())
 }
 
@@ -970,40 +1179,116 @@ fn print_help_page(cols: u16, rows: u16) -> Result<()> {
         ("Keys", Color::Cyan),
         ("  n / Right / Space     next page", Color::White),
         ("  p / Left              previous page", Color::White),
+        ("  mouse wheel           next / previous page", Color::White),
         ("  g / G                 first / last page", Color::White),
         ("  o                     go to page prompt", Color::White),
-        ("  m                     toggle current page selection", Color::White),
+        (
+            "  m                     toggle current page selection",
+            Color::White,
+        ),
         ("  r / R                 rotate right / left", Color::White),
-        ("  M                     mirror selected/current page", Color::White),
-        ("  d                     delete selected/current page", Color::White),
-        ("  < / >                 move selected/current pages backward / forward", Color::White),
-        ("  c                     crop selected/current pages", Color::White),
-        ("  S                     scan with default DPI", Color::White),
+        (
+            "  M                     mirror selected/current page",
+            Color::White,
+        ),
+        (
+            "  d                     delete selected/current page",
+            Color::White,
+        ),
+        (
+            "  < / >                 move selected/current pages backward / forward",
+            Color::White,
+        ),
+        (
+            "  c                     crop selected/current pages",
+            Color::White,
+        ),
+        (
+            "  S                     scan with default DPI",
+            Color::White,
+        ),
         ("  u / Ctrl-Z / U        undo / redo", Color::White),
         ("  s                     save", Color::White),
-        ("  q / x / Esc / Ctrl-C  quit, Esc closes help/tree/crop first", Color::White),
+        (
+            "  q / x / Esc / Ctrl-C  quit, Esc closes help/tree/crop first",
+            Color::White,
+        ),
         ("", Color::White),
         ("Commands", Color::Cyan),
+        (
+            "  :save, :w             save to current output path",
+            Color::White,
+        ),
+        (
+            "  :save-as PATH         save as PATH; .pdf is added if omitted",
+            Color::White,
+        ),
+        (
+            "  :add [FILE...|DIR]    add files, or open picker when empty/dir",
+            Color::White,
+        ),
+        (
+            "  :ls [DIR]             open add picker; Space marks many",
+            Color::White,
+        ),
         ("  :page N               go to page N", Color::White),
         ("  :select 1,3-5         select page set", Color::White),
         ("  :select all           select every page", Color::White),
-        ("  :unselect 4-7         remove pages from selection", Color::White),
+        (
+            "  :unselect 4-7         remove pages from selection",
+            Color::White,
+        ),
         ("  :unselect all, :clear clear selection", Color::White),
-        ("  :rotate, :right       rotate selected/current pages right", Color::White),
-        ("  :rotate-left, :left   rotate selected/current pages left", Color::White),
-        ("  :mirror, :flip        mirror selected/current pages", Color::White),
-        ("  :delete, :del         delete selected/current pages", Color::White),
-        ("  :crop                 crop selected/current pages", Color::White),
-        ("  :compress LEVEL       LEVEL: screen, medium, print", Color::White),
-        ("  :move N               move selection before page N", Color::White),
-        ("  :back, :forward       move selection one page backward / forward", Color::White),
-        ("  :scan [DPI]           scan one or more pages", Color::White),
-        ("  :add FILE...          append images or PDFs", Color::White),
-        ("  :tree, :history       show full history tree", Color::White),
-        ("  :goto N               jump to history node N", Color::White),
+        (
+            "  :rotate, :right       rotate selected/current pages right",
+            Color::White,
+        ),
+        (
+            "  :rotate-left, :left   rotate selected/current pages left",
+            Color::White,
+        ),
+        (
+            "  :mirror, :flip        mirror selected/current pages",
+            Color::White,
+        ),
+        (
+            "  :delete, :del         delete selected/current pages",
+            Color::White,
+        ),
+        (
+            "  :crop                 crop selected/current pages",
+            Color::White,
+        ),
+        (
+            "  :compress LEVEL       LEVEL: light, normal, strong",
+            Color::White,
+        ),
+        (
+            "  :move N               move selection before page N",
+            Color::White,
+        ),
+        (
+            "  :back/<, :forward/>   move selection one page backward / forward",
+            Color::White,
+        ),
+        (
+            "  :scan [DPI]           scan one or more pages",
+            Color::White,
+        ),
+        (
+            "  :tree, :history       show full history tree",
+            Color::White,
+        ),
+        (
+            "  :goto N               jump to history node N",
+            Color::White,
+        ),
         ("  :undo, :redo          undo / redo", Color::White),
         ("  :q, :quit, :exit      quit", Color::White),
-        ("  :help                 toggle this help page", Color::White),
+        (
+            "  :help                 toggle this help page",
+            Color::White,
+        ),
     ];
     for row in 0..rows {
         execute!(io::stdout(), MoveTo(0, row + 1))?;
@@ -1014,6 +1299,40 @@ fn print_help_page(cols: u16, rows: u16) -> Result<()> {
         } else {
             print!("{}", " ".repeat(cols as usize));
         }
+    }
+    Ok(())
+}
+
+fn print_listing_page(listing: &ListingPage, cols: u16, rows: u16) -> Result<()> {
+    for row in 0..rows {
+        execute!(io::stdout(), MoveTo(0, row + 1))?;
+        if row == 0 {
+            print_colored_segment(&listing.title, Color::Yellow, cols)?;
+        } else if let Some(entry) = listing.entries.get(row.saturating_sub(1) as usize) {
+            let idx = row.saturating_sub(1) as usize;
+            let selected = idx == listing.selected && entry.kind != ListingEntryKind::Empty;
+            let marked = listing.marked.contains(&idx);
+            let color = if selected {
+                Color::Yellow
+            } else if marked {
+                Color::Green
+            } else if entry.kind == ListingEntryKind::Directory {
+                Color::Cyan
+            } else {
+                Color::White
+            };
+            let marker = match (selected, marked) {
+                (true, true) => ">*",
+                (true, false) => "> ",
+                (false, true) => " *",
+                (false, false) => "  ",
+            };
+            print_colored_segment(&format!("{marker}{}", entry.label), color, cols)?;
+        } else {
+            print!("{}", " ".repeat(cols as usize));
+        }
+        execute!(io::stdout(), ResetColor)?;
+        clear_to_end_of_line(cols)?;
     }
     Ok(())
 }
@@ -1133,7 +1452,14 @@ fn end_sync_update() -> Result<()> {
 fn rendered_page_output(state: &mut State, fmt: &str, cols: u16, rows: u16) -> Result<Vec<u8>> {
     if let Some(preview) = state.crop_preview {
         let pdf = state.current_pdf()?.to_path_buf();
-        return render_page_output_with_crop_preview(&pdf, state.page + 1, cols, rows, fmt, preview);
+        return render_page_output_with_crop_preview(
+            &pdf,
+            state.page + 1,
+            cols,
+            rows,
+            fmt,
+            preview,
+        );
     }
     let key = RenderKey {
         snapshot: state.current_snapshot,
@@ -1142,7 +1468,12 @@ fn rendered_page_output(state: &mut State, fmt: &str, cols: u16, rows: u16) -> R
         rows,
         format: fmt.to_string(),
     };
-    if let Some(output) = state.render_cache.lock().ok().and_then(|cache| cache.get(&key).cloned()) {
+    if let Some(output) = state
+        .render_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
         state.last_rendered = Some(output.clone());
         state.last_rendered_key = Some(key);
         return Ok(output);
@@ -1153,12 +1484,14 @@ fn rendered_page_output(state: &mut State, fmt: &str, cols: u16, rows: u16) -> R
         spawn_render_if_needed(
             Arc::clone(&state.render_cache),
             Arc::clone(&state.pending_renders),
-            key,
-            pdf,
-            state.page + 1,
-            cols,
-            rows,
-            fmt.to_string(),
+            RenderRequest {
+                key,
+                pdf,
+                page: state.page + 1,
+                cols,
+                rows,
+                format: fmt.to_string(),
+            },
         );
         state.message = format!("rendering page {}...", state.page + 1);
         return Ok(previous.clone());
@@ -1291,6 +1624,8 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
             state.add_history("clear selection");
             Ok(())
         }
+        "save" | "w" if parts.len() == 1 => save(state),
+        "save-as" | "write" | "w" if parts.len() == 2 => save_as(state, PathBuf::from(&parts[1])),
         "q" | "quit" | "exit" | "close" => {
             std::process::exit(0);
         }
@@ -1309,8 +1644,8 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
             let target = parts[1].parse::<usize>().context("target page required")?;
             move_pages(state, target)
         }
-        "back" | "backward" => move_pages_by(state, -1),
-        "forward" => move_pages_by(state, 1),
+        "back" | "backward" | "<" => move_pages_by(state, -1),
+        "forward" | ">" => move_pages_by(state, 1),
         "scan" => {
             let dpi = parts
                 .get(1)
@@ -1318,10 +1653,16 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
                 .transpose()?;
             scan_pages(state, dpi)
         }
-        "add" => add_files(state, &parts[1..]),
+        "add" => add_command(state, &parts[1..]),
+        "la" | "ls" => list_addable_files(state, parts.get(1).map(String::as_str)),
         "history" | "tree" => {
             state.show_tree_page = !state.show_tree_page;
             state.show_help_page = false;
+            state.listing_page = None;
+            state.tree_cursor = tree_lines(state)
+                .iter()
+                .position(|(id, _)| *id == state.current_snapshot)
+                .unwrap_or(0);
             state.message = if state.show_tree_page {
                 "history tree page shown".into()
             } else {
@@ -1332,6 +1673,7 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
         "help" | "h" | "?" => {
             state.show_help_page = !state.show_help_page;
             state.show_tree_page = false;
+            state.listing_page = None;
             state.message = if state.show_help_page {
                 "help page shown".into()
             } else {
@@ -1342,6 +1684,10 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
         "goto" if parts.len() == 2 => {
             let id = parts[1].parse::<usize>().context("history node required")?;
             state.restore_snapshot(id)?;
+            state.tree_cursor = tree_lines(state)
+                .iter()
+                .position(|(line_id, _)| *line_id == id)
+                .unwrap_or(0);
             state.message = format!("history: moved to {id}");
             state.add_history(state.message.clone());
             Ok(())
@@ -1482,10 +1828,11 @@ fn mirror(state: &mut State, use_selection: bool) -> Result<()> {
     let targets = state.targets(use_selection)?;
     let mut replacements = BTreeMap::new();
     for page in &targets {
-        let dest = state
-            .temp
-            .path()
-            .join(format!("mirror-{}-{}.pdf", page + 1, state.next_snapshot));
+        let dest =
+            state
+                .temp
+                .path()
+                .join(format!("mirror-{}-{}.pdf", page + 1, state.next_snapshot));
         mirror_page_to_pdf(state.current_pdf()?, page + 1, &dest)?;
         replacements.insert(*page, dest);
     }
@@ -1591,29 +1938,19 @@ fn crop_pages(state: &mut State, fmt: &str, use_selection: bool) -> Result<()> {
             _ => {}
         }
     }
-    let (max_width, max_height) = current_render_pixel_limits();
-    let mut replacements = BTreeMap::new();
-    for page in &pages {
-        let dest = state
-            .temp
-            .path()
-            .join(format!("crop-{}-{}.pdf", page + 1, state.next_snapshot));
-        crop_page_to_pdf(
-            state.current_pdf()?,
-            page + 1,
-            &dest,
-            margins,
-            max_width,
-            max_height,
-        )?;
-        replacements.insert(*page, dest);
-    }
+    let (max_width, max_height) = crop_preview_pixel_limits(state);
     let out = state
         .temp
         .path()
         .join(format!("crop-{}.pdf", state.next_snapshot));
-    rebuild_with_replacements(state.current_pdf()?, state.page_count, &replacements, &out)?;
-    state.replace_current(out, format!("crop: page {}", page_list_label(pages)))
+    fs::copy(state.current_pdf()?, &out)
+        .with_context(|| format!("copy crop source to {}", out.display()))?;
+    for page in &pages {
+        crop_page_boxes(&out, page + 1, margins, max_width, max_height)?;
+    }
+    state.replace_current(out, format!("crop: page {}", page_list_label(pages)))?;
+    state.message = "crop applied without raster recompression; qpdf ok".into();
+    Ok(())
 }
 
 fn drain_pending_crop_adjust_inputs() -> Result<()> {
@@ -1633,14 +1970,17 @@ fn drain_pending_crop_adjust_inputs() -> Result<()> {
 fn compress_pages(state: &mut State, level: &str, use_selection: bool) -> Result<()> {
     let targets = state.targets(use_selection)?;
     let (max_width, max_height, label) = compression_limits(level)?;
+    let before_size = state.current_pdf().and_then(file_size).unwrap_or(0);
     let mut replacements = BTreeMap::new();
     for page in &targets {
-        let dest = state
-            .temp
-            .path()
-            .join(format!("compress-{}-{}.pdf", page + 1, state.next_snapshot));
+        let dest =
+            state
+                .temp
+                .path()
+                .join(format!("compress-{}-{}.pdf", page + 1, state.next_snapshot));
+        let page_size = pdf_page_size(state.current_pdf()?, page + 1)?;
         let bitmap = render_page_bitmap(state.current_pdf()?, page + 1, max_width, max_height)?;
-        bitmap_to_pdf(&bitmap, &dest)?;
+        bitmap_to_pdf_with_page_size(&bitmap, &dest, page_size)?;
         replacements.insert(*page, dest);
     }
     let out = state
@@ -1651,16 +1991,55 @@ fn compress_pages(state: &mut State, level: &str, use_selection: bool) -> Result
     state.replace_current(
         out,
         format!("compress {label}: page {}", page_list_label(targets)),
-    )
+    )?;
+    let after_size = state.current_pdf().and_then(file_size).unwrap_or(0);
+    state.message = compression_message(label, before_size, after_size);
+    Ok(())
 }
 
 fn compression_limits(level: &str) -> Result<(usize, usize, &'static str)> {
     match level {
-        "screen" | "small" | "low" => Ok((900, 1200, "screen")),
-        "medium" | "ebook" | "default" => Ok((1400, 1900, "medium")),
-        "print" | "printer" | "high" => Ok((2000, 2800, "print")),
-        _ => bail!("compression level must be screen, medium, or print"),
+        "strong" | "preview" | "screen" | "small" | "low" => Ok((900, 1200, "strong")),
+        "normal" | "email" | "medium" | "ebook" | "default" => Ok((1400, 1900, "normal")),
+        "light" | "archive" | "print" | "printer" | "high" => Ok((2000, 2800, "light")),
+        _ => bail!("compression level must be light, normal, or strong"),
     }
+}
+
+fn compression_message(label: &str, before: u64, after: u64) -> String {
+    if before == 0 || after == 0 {
+        return format!("compressed with {label}; qpdf ok");
+    }
+    let before_label = human_size(before);
+    let after_label = human_size(after);
+    if after <= before {
+        let saved = before - after;
+        let percent = saved as f64 * 100.0 / before as f64;
+        format!("compressed {label}: {before_label} -> {after_label} ({percent:.1}% smaller)")
+    } else {
+        let larger = after - before;
+        let percent = larger as f64 * 100.0 / before as f64;
+        format!("compressed {label}: {before_label} -> {after_label} ({percent:.1}% larger; undo if needed)")
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn file_size(path: &Path) -> Result<u64> {
+    Ok(fs::metadata(path)?.len())
 }
 
 fn scan_pages(state: &mut State, dpi: Option<u32>) -> Result<()> {
@@ -1692,6 +2071,7 @@ fn scan_pages(state: &mut State, dpi: Option<u32>) -> Result<()> {
 }
 
 fn run_scan_command(out: &Path, dpi: Option<u32>) -> Result<()> {
+    sudo_preflight()?;
     let command = std::env::var("PDFVIEW_SCAN_COMMAND").unwrap_or_else(|_| {
         "source ~/coding/hpscan/hpscan.zsh && hpscan \"$1\" \"$2\"".to_string()
     });
@@ -1710,14 +2090,47 @@ fn run_scan_command(out: &Path, dpi: Option<u32>) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        bail!("scan command failed with {status}");
+        bail!(
+            "scan command failed with {status}; if sudo rejected the password, stop scanning and test `sudo -v` in a normal terminal"
+        );
     }
 }
 
-fn add_files(state: &mut State, paths: &[String]) -> Result<()> {
-    if paths.is_empty() {
-        bail!("usage: :add image-or-pdf [...]");
+fn sudo_preflight() -> Result<()> {
+    println!("Checking sudo authentication before scanner command...");
+    io::stdout().flush()?;
+    let status = Command::new("sudo")
+        .arg("-v")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("run sudo -v before scan")?;
+    if status.success() {
+        println!("Sudo authentication ok.");
+        io::stdout().flush()?;
+        Ok(())
+    } else {
+        bail!(
+            "sudo authentication failed before scan; wait for faillock unlock if needed, then test `sudo -v` in a normal terminal"
+        )
     }
+}
+
+fn add_command(state: &mut State, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return list_addable_files(state, None);
+    }
+    if paths.len() == 1 {
+        let path = expand_path(PathBuf::from(&paths[0]))?;
+        if path.is_dir() {
+            return list_addable_files(state, Some(&path.display().to_string()));
+        }
+    }
+    add_files(state, paths)
+}
+
+fn add_files(state: &mut State, paths: &[String]) -> Result<()> {
     let mut added = 0;
     for raw in paths {
         let path = expand_path(PathBuf::from(raw))?;
@@ -1727,10 +2140,12 @@ fn add_files(state: &mut State, paths: &[String]) -> Result<()> {
             image_to_pdf(&path, &pdf)?;
             append_pdf_file(state, &pdf, false)?;
             added += 1;
-        } else {
+        } else if is_pdf(&path) {
             let before = state.page_count;
             append_pdf_file(state, &path, false)?;
             added += state.page_count - before;
+        } else {
+            bail!("unsupported add file type: {}", path.display());
         }
     }
     if added > 0 {
@@ -1738,6 +2153,99 @@ fn add_files(state: &mut State, paths: &[String]) -> Result<()> {
         state.message = format!("added {added} page{}", plural(added));
     }
     Ok(())
+}
+
+fn list_addable_files(state: &mut State, raw_dir: Option<&str>) -> Result<()> {
+    let dir = expand_path(PathBuf::from(raw_dir.unwrap_or(".")))?;
+    if !dir.is_dir() {
+        bail!("not a directory: {}", dir.display());
+    }
+    let mut dirs: Vec<ListingEntry> = Vec::new();
+    let mut files: Vec<ListingEntry> = Vec::new();
+    if let Some(parent) = dir.parent() {
+        dirs.push(ListingEntry {
+            label: "../".into(),
+            path: parent.to_path_buf(),
+            kind: ListingEntryKind::Directory,
+        });
+    }
+    for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            dirs.push(ListingEntry {
+                label: format!("{name}/"),
+                path,
+                kind: ListingEntryKind::Directory,
+            });
+        } else if is_image(&path) || is_pdf(&path) {
+            files.push(ListingEntry {
+                label: name.to_string(),
+                path,
+                kind: ListingEntryKind::File,
+            });
+        }
+    }
+    dirs.sort_by_key(|item| item.label.to_ascii_lowercase());
+    files.sort_by_key(|item| item.label.to_ascii_lowercase());
+    let mut entries = Vec::new();
+    entries.extend(dirs);
+    entries.extend(files);
+    if entries.is_empty() {
+        entries.push(ListingEntry {
+            label: "(no addable PDFs/images here)".into(),
+            path: dir.clone(),
+            kind: ListingEntryKind::Empty,
+        });
+    }
+    state.show_tree_page = false;
+    state.show_help_page = false;
+    state.listing_page = Some(ListingPage {
+        title: format!("Addable files in {} | Enter add/open", dir.display()),
+        entries,
+        selected: 0,
+        marked: BTreeSet::new(),
+    });
+    state.message = "file list shown; Esc closes".into();
+    Ok(())
+}
+
+fn activate_listing_selection(state: &mut State) -> Result<()> {
+    let Some(listing) = &state.listing_page else {
+        return Ok(());
+    };
+    if !listing.marked.is_empty() {
+        let paths = listing
+            .marked
+            .iter()
+            .filter_map(|idx| listing.entries.get(*idx))
+            .filter(|entry| entry.kind == ListingEntryKind::File)
+            .map(|entry| entry.path.display().to_string())
+            .collect::<Vec<_>>();
+        state.listing_page = None;
+        return add_files(state, &paths);
+    }
+    let Some(entry) = listing.entries.get(listing.selected) else {
+        return Ok(());
+    };
+    match entry.kind {
+        ListingEntryKind::Directory => {
+            let path = entry.path.clone();
+            list_addable_files(state, Some(&path.display().to_string()))
+        }
+        ListingEntryKind::File => {
+            let path = entry.path.clone();
+            state.listing_page = None;
+            add_files(state, &[path.display().to_string()])
+        }
+        ListingEntryKind::Empty => Ok(()),
+    }
 }
 
 fn append_pdf_file(state: &mut State, path: &Path, record: bool) -> Result<()> {
@@ -1813,13 +2321,43 @@ fn save(state: &mut State) -> Result<()> {
     } else {
         state.out.clone()
     };
+    let _ = save_to_path(state, out)?;
+    Ok(())
+}
+
+fn save_as(state: &mut State, out: PathBuf) -> Result<()> {
+    let out = pdf_output_path(expand_path(out)?)?;
+    if save_to_path(state, out.clone())? {
+        state.out = out;
+        state.overwrite = false;
+    }
+    Ok(())
+}
+
+fn pdf_output_path(path: PathBuf) -> Result<PathBuf> {
+    if path.extension().is_none() {
+        let mut name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("output path must include a file name"))?
+            .to_os_string();
+        name.push(".pdf");
+        Ok(path.with_file_name(name))
+    } else {
+        Ok(path)
+    }
+}
+
+fn save_to_path(state: &mut State, out: PathBuf) -> Result<bool> {
     let current = state.current_pdf()?;
     if out.exists()
         && Some(&out) != state.original.as_ref()
-        && !confirm(&format!("{} exists. Overwrite? [y/N] ", out.display()))?
+        && !confirm(&format!(
+            "Save to {}? File exists; overwrite? [y/N] ",
+            out.display()
+        ))?
     {
-        state.message = "save cancelled".into();
-        return Ok(());
+        state.message = format!("save cancelled: {}", out.display());
+        return Ok(false);
     }
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
@@ -1836,9 +2374,9 @@ fn save(state: &mut State) -> Result<()> {
     tmp.persist(&out).map_err(|e| anyhow!(e.error))?;
     state.saved_snapshot = state.current_snapshot;
     state.dirty = false;
-    state.message = "saved; qpdf ok".into();
+    state.message = format!("saved to {}; qpdf ok", out.display());
     state.add_history(format!("save: {}", out.display()));
-    Ok(())
+    Ok(true)
 }
 
 struct Bitmap {
@@ -1875,7 +2413,18 @@ fn prefetch_pages(state: &State, cols: u16, rows: u16, fmt: &str) {
                 rows,
                 format: fmt.clone(),
             };
-            render_key_into_cache(&cache, &pending, key, &pdf, page + 1, cols, rows, &fmt);
+            render_key_into_cache(
+                &cache,
+                &pending,
+                RenderRequest {
+                    key,
+                    pdf: pdf.clone(),
+                    page: page + 1,
+                    cols,
+                    rows,
+                    format: fmt.clone(),
+                },
+            );
         }
     });
 }
@@ -1883,28 +2432,19 @@ fn prefetch_pages(state: &State, cols: u16, rows: u16, fmt: &str) {
 fn spawn_render_if_needed(
     cache: Arc<Mutex<HashMap<RenderKey, Vec<u8>>>>,
     pending: Arc<Mutex<HashSet<RenderKey>>>,
-    key: RenderKey,
-    pdf: PathBuf,
-    page: usize,
-    cols: u16,
-    rows: u16,
-    fmt: String,
+    request: RenderRequest,
 ) {
     thread::spawn(move || {
-        render_key_into_cache(&cache, &pending, key, &pdf, page, cols, rows, &fmt);
+        render_key_into_cache(&cache, &pending, request);
     });
 }
 
 fn render_key_into_cache(
     cache: &Arc<Mutex<HashMap<RenderKey, Vec<u8>>>>,
     pending: &Arc<Mutex<HashSet<RenderKey>>>,
-    key: RenderKey,
-    pdf: &Path,
-    page: usize,
-    cols: u16,
-    rows: u16,
-    fmt: &str,
+    request: RenderRequest,
 ) {
+    let key = request.key.clone();
     if cache.lock().is_ok_and(|cache| cache.contains_key(&key)) {
         return;
     }
@@ -1916,7 +2456,13 @@ fn render_key_into_cache(
             return;
         }
     }
-    if let Ok(bytes) = render_page_output(pdf, page, cols, rows, fmt) {
+    if let Ok(bytes) = render_page_output(
+        &request.pdf,
+        request.page,
+        request.cols,
+        request.rows,
+        &request.format,
+    ) {
         if let Ok(mut cache) = cache.lock() {
             cache.entry(key.clone()).or_insert(bytes);
         }
@@ -1959,65 +2505,184 @@ fn render_pixel_limits(cols: u16, rows: u16) -> (usize, usize) {
     )
 }
 
-fn current_render_pixel_limits() -> (usize, usize) {
+fn crop_preview_pixel_limits(state: &State) -> (usize, usize) {
     let (cols, rows) = terminal::size().unwrap_or((100, 40));
-    let footer_lines = 2;
+    let footer_lines = 3 + usize::from(!state.history.is_empty());
     let footer_start = rows.saturating_sub(footer_lines as u16).max(3);
     let image_rows = footer_start.saturating_sub(2).max(5);
     render_pixel_limits(cols, image_rows)
 }
 
-fn crop_page_to_pdf(
+fn crop_page_boxes(
     pdf: &Path,
     page: usize,
-    out: &Path,
     margins: [u32; 4],
     max_width: usize,
     max_height: usize,
 ) -> Result<()> {
-    let bitmap = render_page_bitmap(pdf, page, max_width, max_height)?;
-    let cropped = crop_bitmap(&bitmap, margins)?;
-    bitmap_to_pdf(&cropped, out)
-}
-
-fn crop_bitmap(bitmap: &Bitmap, margins: [u32; 4]) -> Result<Bitmap> {
-    let min_size = 24_usize;
-    let mut left = margins[0].min(bitmap.width.saturating_sub(min_size) as u32) as usize;
-    let mut top = margins[1].min(bitmap.height.saturating_sub(min_size) as u32) as usize;
-    let mut right = margins[2].min(bitmap.width.saturating_sub(min_size) as u32) as usize;
-    let mut bottom = margins[3].min(bitmap.height.saturating_sub(min_size) as u32) as usize;
-    if left + right > bitmap.width.saturating_sub(min_size) {
-        let excess = left + right - bitmap.width.saturating_sub(min_size);
-        right = right.saturating_sub(excess);
-        if left + right > bitmap.width.saturating_sub(min_size) {
-            left = bitmap.width.saturating_sub(min_size + right);
-        }
-    }
-    if top + bottom > bitmap.height.saturating_sub(min_size) {
-        let excess = top + bottom - bitmap.height.saturating_sub(min_size);
-        bottom = bottom.saturating_sub(excess);
-        if top + bottom > bitmap.height.saturating_sub(min_size) {
-            top = bitmap.height.saturating_sub(min_size + bottom);
-        }
-    }
-    let width = bitmap.width - left - right;
-    let height = bitmap.height - top - bottom;
-    if width < min_size || height < min_size {
+    let page_size = pdf_page_size(pdf, page)?;
+    let scale = render_scale(page_size, max_width, max_height);
+    let margins = [
+        margins[0] as f64 / scale,
+        margins[1] as f64 / scale,
+        margins[2] as f64 / scale,
+        margins[3] as f64 / scale,
+    ];
+    let page_box = page_box(pdf, page)?;
+    let min_size = 12.0;
+    let left = (page_box.left + margins[0]).min(page_box.right - min_size);
+    let top = (page_box.top - margins[1]).max(page_box.bottom + min_size);
+    let right = (page_box.right - margins[2]).max(left + min_size);
+    let bottom = (page_box.bottom + margins[3]).min(top - min_size);
+    if right - left < min_size || top - bottom < min_size {
         bail!("crop leaves too little page content");
     }
-    let stride = width * 4;
-    let mut data = vec![0_u8; stride * height];
-    for y in 0..height {
-        let src = (top + y) * bitmap.stride + left * 4;
-        let dst = y * stride;
-        data[dst..dst + stride].copy_from_slice(&bitmap.data[src..src + stride]);
+    update_page_box(
+        pdf,
+        page,
+        PageBox {
+            left,
+            bottom,
+            right,
+            top,
+        },
+    )
+}
+
+fn render_scale(page_size: PageSize, max_width: usize, max_height: usize) -> f64 {
+    (max_width as f64 / page_size.width)
+        .min(max_height as f64 / page_size.height)
+        .max(0.1)
+}
+
+fn pdf_page_size(pdf: &Path, page: usize) -> Result<PageSize> {
+    let uri = CString::new(path_to_file_uri(pdf))?;
+    let document = unsafe {
+        poppler_document_new_from_file(uri.as_ptr(), std::ptr::null(), std::ptr::null_mut())
+    };
+    if document.is_null() {
+        bail!("Poppler could not open {}", pdf.display());
     }
-    Ok(Bitmap {
-        width,
-        height,
-        stride,
-        data,
+    let page_ptr = unsafe { poppler_document_get_page(document, (page - 1) as c_int) };
+    if page_ptr.is_null() {
+        unsafe { g_object_unref(document) };
+        bail!("PDF page not found: {page}");
+    }
+    let mut width = 0.0;
+    let mut height = 0.0;
+    unsafe {
+        poppler_page_get_size(page_ptr, &mut width, &mut height);
+        g_object_unref(page_ptr);
+        g_object_unref(document);
+    }
+    Ok(PageSize { width, height })
+}
+
+fn page_box(pdf: &Path, page: usize) -> Result<PageBox> {
+    let object = page_object(pdf, page)?;
+    let json = qpdf_json_for_object(pdf, &object)?;
+    let object_key = format!("obj:{object}");
+    let value = json
+        .get("qpdf")
+        .and_then(Value::as_array)
+        .and_then(|items| items.get(1))
+        .and_then(|objects| objects.get(&object_key))
+        .and_then(|object| object.get("value"))
+        .ok_or_else(|| anyhow!("qpdf JSON did not include page object {object}"))?;
+    let media = value
+        .get("/CropBox")
+        .or_else(|| value.get("/MediaBox"))
+        .ok_or_else(|| anyhow!("page {page} has no MediaBox"))?;
+    parse_page_box(media)
+}
+
+fn page_object(pdf: &Path, page: usize) -> Result<String> {
+    let output = Command::new("qpdf")
+        .arg("--json")
+        .arg("--json-key=pages")
+        .arg(pdf)
+        .output()
+        .with_context(|| "run qpdf --json")?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let json: Value = serde_json::from_slice(&output.stdout).context("parse qpdf pages JSON")?;
+    json.get("pages")
+        .and_then(Value::as_array)
+        .and_then(|pages| pages.get(page - 1))
+        .and_then(|page| page.get("object"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("qpdf JSON did not include page {page}"))
+}
+
+fn qpdf_json_for_object(pdf: &Path, object: &str) -> Result<Value> {
+    let output = Command::new("qpdf")
+        .arg("--json")
+        .arg(format!("--json-object={object}"))
+        .arg(pdf)
+        .output()
+        .with_context(|| "run qpdf --json-object")?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    serde_json::from_slice(&output.stdout).context("parse qpdf object JSON")
+}
+
+fn parse_page_box(value: &Value) -> Result<PageBox> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow!("page box is not an array"))?;
+    if values.len() != 4 {
+        bail!("page box should have 4 numbers");
+    }
+    let mut nums = [0.0; 4];
+    for (idx, value) in values.iter().enumerate() {
+        nums[idx] = value
+            .as_f64()
+            .ok_or_else(|| anyhow!("page box contains a non-number"))?;
+    }
+    Ok(PageBox {
+        left: nums[0],
+        bottom: nums[1],
+        right: nums[2],
+        top: nums[3],
     })
+}
+
+fn update_page_box(pdf: &Path, page: usize, page_box: PageBox) -> Result<()> {
+    let object = page_object(pdf, page)?;
+    let mut json = qpdf_json_for_object(pdf, &object)?;
+    let object_key = format!("obj:{object}");
+    let objects = json
+        .get_mut("qpdf")
+        .and_then(Value::as_array_mut)
+        .and_then(|items| items.get_mut(1))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("qpdf JSON did not include object table"))?;
+    let value = objects
+        .get_mut(&object_key)
+        .and_then(|object| object.get_mut("value"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("qpdf JSON did not include page object {object}"))?;
+    let box_value =
+        serde_json::json!([page_box.left, page_box.bottom, page_box.right, page_box.top]);
+    value.insert("/MediaBox".into(), box_value.clone());
+    value.insert("/CropBox".into(), box_value);
+
+    let update = pdf.with_file_name(format!(
+        ".{}.page-{page}.json",
+        pdf.file_name().and_then(OsStr::to_str).unwrap_or("pdfview")
+    ));
+    fs::write(&update, serde_json::to_vec(&json)?)
+        .with_context(|| format!("write {}", update.display()))?;
+    let result = run(Command::new("qpdf")
+        .arg(pdf)
+        .arg(format!("--update-from-json={}", update.display()))
+        .arg("--replace-input"));
+    let _ = fs::remove_file(&update);
+    result?;
+    qpdf_check(pdf)
 }
 
 fn draw_crop_overlay(bitmap: &mut Bitmap, preview: CropPreview) {
@@ -2027,12 +2692,28 @@ fn draw_crop_overlay(bitmap: &mut Bitmap, preview: CropPreview) {
     let bottom = preview.margins[3].min(bitmap.height as u32) as usize;
     shade_rect(bitmap, 0, 0, left, bitmap.height);
     shade_rect(bitmap, 0, 0, bitmap.width, top);
-    shade_rect(bitmap, bitmap.width.saturating_sub(right), 0, right, bitmap.height);
-    shade_rect(bitmap, 0, bitmap.height.saturating_sub(bottom), bitmap.width, bottom);
+    shade_rect(
+        bitmap,
+        bitmap.width.saturating_sub(right),
+        0,
+        right,
+        bitmap.height,
+    );
+    shade_rect(
+        bitmap,
+        0,
+        bitmap.height.saturating_sub(bottom),
+        bitmap.width,
+        bottom,
+    );
     draw_vline(bitmap, left, [220, 0, 0, 255]);
     draw_hline(bitmap, top, [220, 0, 0, 255]);
     draw_vline(bitmap, bitmap.width.saturating_sub(right), [220, 0, 0, 255]);
-    draw_hline(bitmap, bitmap.height.saturating_sub(bottom), [220, 0, 0, 255]);
+    draw_hline(
+        bitmap,
+        bitmap.height.saturating_sub(bottom),
+        [220, 0, 0, 255],
+    );
 }
 
 fn shade_rect(bitmap: &mut Bitmap, x: usize, y: usize, width: usize, height: usize) {
@@ -2070,9 +2751,12 @@ fn draw_hline(bitmap: &mut Bitmap, y: usize, color: [u8; 4]) {
 fn blend_pixel(bitmap: &mut Bitmap, x: usize, y: usize, rgba: [u8; 4]) {
     let idx = y * bitmap.stride + x * 4;
     let alpha = rgba[3] as u16;
-    bitmap.data[idx] = ((bitmap.data[idx] as u16 * (255 - alpha) + rgba[2] as u16 * alpha) / 255) as u8;
-    bitmap.data[idx + 1] = ((bitmap.data[idx + 1] as u16 * (255 - alpha) + rgba[1] as u16 * alpha) / 255) as u8;
-    bitmap.data[idx + 2] = ((bitmap.data[idx + 2] as u16 * (255 - alpha) + rgba[0] as u16 * alpha) / 255) as u8;
+    bitmap.data[idx] =
+        ((bitmap.data[idx] as u16 * (255 - alpha) + rgba[2] as u16 * alpha) / 255) as u8;
+    bitmap.data[idx + 1] =
+        ((bitmap.data[idx + 1] as u16 * (255 - alpha) + rgba[1] as u16 * alpha) / 255) as u8;
+    bitmap.data[idx + 2] =
+        ((bitmap.data[idx + 2] as u16 * (255 - alpha) + rgba[0] as u16 * alpha) / 255) as u8;
     bitmap.data[idx + 3] = 255;
 }
 
@@ -2085,9 +2769,10 @@ fn set_pixel(bitmap: &mut Bitmap, x: usize, y: usize, rgba: [u8; 4]) {
 }
 
 fn mirror_page_to_pdf(pdf: &Path, page: usize, out: &Path) -> Result<()> {
-    let mut bitmap = render_page_bitmap(pdf, page, 1600, 2200)?;
+    let page_size = pdf_page_size(pdf, page)?;
+    let mut bitmap = render_page_bitmap_at_dpi(pdf, page, RASTER_EDIT_DPI)?;
     flip_bitmap_horizontally(&mut bitmap);
-    bitmap_to_pdf(&bitmap, out)
+    bitmap_to_pdf_with_page_size(&bitmap, out, page_size)
 }
 
 fn flip_bitmap_horizontally(bitmap: &mut Bitmap) {
@@ -2103,10 +2788,26 @@ fn flip_bitmap_horizontally(bitmap: &mut Bitmap) {
     }
 }
 
+#[cfg(test)]
 fn bitmap_to_pdf(bitmap: &Bitmap, out: &Path) -> Result<()> {
+    bitmap_to_pdf_with_page_size(
+        bitmap,
+        out,
+        PageSize {
+            width: bitmap.width as f64,
+            height: bitmap.height as f64,
+        },
+    )
+}
+
+fn bitmap_to_pdf_with_page_size(bitmap: &Bitmap, out: &Path, page_size: PageSize) -> Result<()> {
     let path = CString::new(out.to_string_lossy().as_bytes())?;
     let pdf_surface = unsafe {
-        cairo_pdf_surface_create(path.as_ptr(), bitmap.width as c_double, bitmap.height as c_double)
+        cairo_pdf_surface_create(
+            path.as_ptr(),
+            page_size.width as c_double,
+            page_size.height as c_double,
+        )
     };
     if pdf_surface.is_null() {
         bail!("create cairo PDF surface failed");
@@ -2126,6 +2827,11 @@ fn bitmap_to_pdf(bitmap: &Bitmap, out: &Path) -> Result<()> {
     }
     let cr = unsafe { cairo_create(pdf_surface) };
     unsafe {
+        cairo_scale(
+            cr,
+            page_size.width / bitmap.width as f64,
+            page_size.height / bitmap.height as f64,
+        );
         cairo_set_source_surface(cr, image_surface, 0.0, 0.0);
         cairo_paint(cr);
         cairo_destroy(cr);
@@ -2135,15 +2841,29 @@ fn bitmap_to_pdf(bitmap: &Bitmap, out: &Path) -> Result<()> {
     qpdf_check(out)
 }
 
-fn render_page_bitmap(pdf: &Path, page: usize, max_width: usize, max_height: usize) -> Result<Bitmap> {
+fn render_page_bitmap_at_dpi(pdf: &Path, page: usize, dpi: f64) -> Result<Bitmap> {
+    let page_size = pdf_page_size(pdf, page)?;
+    let max_width = (page_size.width * dpi / 72.0).ceil().max(1.0) as usize;
+    let max_height = (page_size.height * dpi / 72.0).ceil().max(1.0) as usize;
+    render_page_bitmap(pdf, page, max_width, max_height)
+}
+
+fn render_page_bitmap(
+    pdf: &Path,
+    page: usize,
+    max_width: usize,
+    max_height: usize,
+) -> Result<Bitmap> {
     let uri = CString::new(path_to_file_uri(pdf))?;
-    let document = unsafe { poppler_document_new_from_file(uri.as_ptr(), std::ptr::null(), std::ptr::null_mut()) };
+    let document = unsafe {
+        poppler_document_new_from_file(uri.as_ptr(), std::ptr::null(), std::ptr::null_mut())
+    };
     if document.is_null() {
         bail!("Poppler could not open {}", pdf.display());
     }
     let page_ptr = unsafe { poppler_document_get_page(document, (page - 1) as c_int) };
     if page_ptr.is_null() {
-        unsafe { g_object_unref(document as *mut c_void) };
+        unsafe { g_object_unref(document) };
         bail!("PDF page not found: {page}");
     }
     let mut page_width = 0.0;
@@ -2154,11 +2874,12 @@ fn render_page_bitmap(pdf: &Path, page: usize, max_width: usize, max_height: usi
         .max(0.1);
     let width = (page_width * scale).ceil().max(1.0) as usize;
     let height = (page_height * scale).ceil().max(1.0) as usize;
-    let surface = unsafe { cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width as c_int, height as c_int) };
+    let surface =
+        unsafe { cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width as c_int, height as c_int) };
     if surface.is_null() {
         unsafe {
-            g_object_unref(page_ptr as *mut c_void);
-            g_object_unref(document as *mut c_void);
+            g_object_unref(page_ptr);
+            g_object_unref(document);
         }
         bail!("create cairo surface failed");
     }
@@ -2176,8 +2897,8 @@ fn render_page_bitmap(pdf: &Path, page: usize, max_width: usize, max_height: usi
         unsafe {
             cairo_destroy(cr);
             cairo_surface_destroy(surface);
-            g_object_unref(page_ptr as *mut c_void);
-            g_object_unref(document as *mut c_void);
+            g_object_unref(page_ptr);
+            g_object_unref(document);
         }
         bail!("read cairo surface failed");
     }
@@ -2185,10 +2906,15 @@ fn render_page_bitmap(pdf: &Path, page: usize, max_width: usize, max_height: usi
     unsafe {
         cairo_destroy(cr);
         cairo_surface_destroy(surface);
-        g_object_unref(page_ptr as *mut c_void);
-        g_object_unref(document as *mut c_void);
+        g_object_unref(page_ptr);
+        g_object_unref(document);
     }
-    Ok(Bitmap { width, height, stride, data })
+    Ok(Bitmap {
+        width,
+        height,
+        stride,
+        data,
+    })
 }
 
 fn kitty_image_bytes(bitmap: &Bitmap, cols: u16, rows: u16) -> Vec<u8> {
@@ -2201,8 +2927,8 @@ fn kitty_image_bytes(bitmap: &Bitmap, cols: u16, rows: u16) -> Vec<u8> {
     }
     let encoded = base64_encode(&rgba);
     let mut out = Vec::with_capacity(encoded.len() + 128);
-    let display_cols = ((bitmap.width + 9) / 10).clamp(1, cols as usize);
-    let display_rows = ((bitmap.height + 19) / 20).clamp(1, rows as usize);
+    let display_cols = bitmap.width.div_ceil(10).clamp(1, cols as usize);
+    let display_rows = bitmap.height.div_ceil(20).clamp(1, rows as usize);
     let header = format!(
         "\x1b_Ga=T,f=32,s={},v={},c={},r={},q=2,m=0;",
         bitmap.width, bitmap.height, display_cols, display_rows
@@ -2312,14 +3038,8 @@ fn image_to_pdf(image: &Path, out: &Path) -> Result<()> {
     run(Command::new("magick")
         .arg(image)
         .arg("-auto-orient")
-        .arg("-resize")
-        .arg(format!("{A4_SIZE}>"))
-        .arg("-gravity")
-        .arg("center")
-        .arg("-background")
-        .arg("white")
-        .arg("-extent")
-        .arg(A4_SIZE)
+        .arg("-density")
+        .arg(IMAGE_IMPORT_DPI)
         .arg(out))
 }
 
@@ -2447,6 +3167,12 @@ fn is_image(path: &Path) -> bool {
         .and_then(OsStr::to_str)
         .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
 }
 
 fn native_format() -> String {
@@ -2625,5 +3351,420 @@ mod tests {
         qpdf_check(&reordered)?;
         assert_eq!(page_count(&reordered)?, 2);
         Ok(())
+    }
+
+    #[test]
+    fn add_files_appends_images_and_pdfs() -> Result<()> {
+        if require_tool("magick").is_err()
+            || require_tool("qpdf").is_err()
+            || require_tool("pdfinfo").is_err()
+        {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let png = temp.path().join("scan.png");
+        let jpg = temp.path().join("photo.jpg");
+        let pdf = temp.path().join("doc.pdf");
+        run(Command::new("magick")
+            .arg("-size")
+            .arg("120x160")
+            .arg("xc:white")
+            .arg(&png))?;
+        run(Command::new("magick")
+            .arg("-size")
+            .arg("120x160")
+            .arg("xc:black")
+            .arg(&jpg))?;
+        run(Command::new("magick")
+            .arg("-size")
+            .arg("120x160")
+            .arg("xc:gray")
+            .arg(&pdf))?;
+
+        let args = Args {
+            pdf: None,
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+        add_files(
+            &mut state,
+            &[
+                png.display().to_string(),
+                jpg.display().to_string(),
+                pdf.display().to_string(),
+            ],
+        )?;
+
+        assert_eq!(state.page_count, 3);
+        qpdf_check(state.current_pdf()?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn image_import_preserves_source_pixel_dimensions() -> Result<()> {
+        if require_tool("magick").is_err()
+            || require_tool("qpdf").is_err()
+            || require_tool("pdfimages").is_err()
+        {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let image = temp.path().join("photo.jpg");
+        let pdf = temp.path().join("photo.pdf");
+        run(Command::new("magick")
+            .arg("-size")
+            .arg("1800x2400")
+            .arg("gradient:")
+            .arg(&image))?;
+
+        image_to_pdf(&image, &pdf)?;
+
+        let images = pdfimages_list(&pdf)?;
+        assert!(images.contains("1800  2400"), "{images}");
+        assert!(!images.contains("595   842"), "{images}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsupported_add_file_type() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let note = temp.path().join("note.txt");
+        fs::write(&note, b"not a pdf or image")?;
+
+        let args = Args {
+            pdf: None,
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+
+        let err = add_files(&mut state, &[note.display().to_string()]).unwrap_err();
+        assert!(err.to_string().contains("unsupported add file type"));
+        Ok(())
+    }
+
+    #[test]
+    fn save_as_writes_pdf_and_updates_output_path() -> Result<()> {
+        if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.pdf");
+        let bitmap = solid_bitmap(320, 420, [255, 255, 255, 255]);
+        bitmap_to_pdf(&bitmap, &source)?;
+
+        let args = Args {
+            pdf: Some(source),
+            page: 1,
+            out: None,
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+        let renamed = temp.path().join("renamed.pdf");
+
+        save_as(&mut state, renamed.clone())?;
+
+        assert_eq!(state.out, renamed);
+        assert!(!state.overwrite);
+        assert!(!state.dirty);
+        qpdf_check(&state.out)?;
+        assert_eq!(page_count(&state.out)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn save_as_adds_pdf_extension_when_omitted() -> Result<()> {
+        if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.pdf");
+        let bitmap = solid_bitmap(320, 420, [255, 255, 255, 255]);
+        bitmap_to_pdf(&bitmap, &source)?;
+
+        let args = Args {
+            pdf: Some(source),
+            page: 1,
+            out: None,
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+        let raw = temp.path().join("renamed");
+
+        save_as(&mut state, raw)?;
+
+        assert_eq!(state.out, temp.path().join("renamed.pdf"));
+        qpdf_check(&state.out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn save_to_existing_path_can_be_cancelled_without_changing_output_path() -> Result<()> {
+        if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.pdf");
+        let existing = temp.path().join("existing.pdf");
+        let bitmap = solid_bitmap(320, 420, [255, 255, 255, 255]);
+        bitmap_to_pdf(&bitmap, &source)?;
+        bitmap_to_pdf(&bitmap, &existing)?;
+
+        let args = Args {
+            pdf: Some(source),
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+        let original_out = state.out.clone();
+
+        state.message = format!("save cancelled: {}", existing.display());
+
+        assert_eq!(state.out, original_out);
+        assert!(state.message.contains("save cancelled"));
+        Ok(())
+    }
+
+    #[test]
+    fn compression_preview_reduces_large_raster_pdf() -> Result<()> {
+        if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("large.pdf");
+        let bitmap = patterned_bitmap(1800, 2400);
+        bitmap_to_pdf(&bitmap, &source)?;
+        let before = file_size(&source)?;
+
+        let args = Args {
+            pdf: Some(source),
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+        compress_pages(&mut state, "preview", true)?;
+        let after = file_size(state.current_pdf()?)?;
+
+        assert!(after < before, "{after} should be smaller than {before}");
+        assert!(state.message.contains("smaller"));
+        qpdf_check(state.current_pdf()?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn crop_updates_page_box_without_rasterizing_images() -> Result<()> {
+        if require_tool("qpdf").is_err()
+            || require_tool("pdfinfo").is_err()
+            || require_tool("pdfimages").is_err()
+        {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.pdf");
+        let bitmap = patterned_bitmap(1800, 2400);
+        bitmap_to_pdf(&bitmap, &source)?;
+
+        let before_size = pdf_page_size(&source, 1)?;
+        let before_images = pdfimages_list(&source)?;
+        assert!(before_images.contains("1800  2400"));
+
+        crop_page_boxes(&source, 1, [100, 80, 120, 90], 900, 1200)?;
+
+        let after_size = pdf_page_size(&source, 1)?;
+        let after_images = pdfimages_list(&source)?;
+        assert!(after_size.width < before_size.width);
+        assert!(after_size.height < before_size.height);
+        assert!(after_images.contains("1800  2400"));
+        qpdf_check(&source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mirror_uses_scan_resolution_instead_of_preview_size() -> Result<()> {
+        if require_tool("qpdf").is_err()
+            || require_tool("pdfinfo").is_err()
+            || require_tool("pdfimages").is_err()
+            || require_tool("magick").is_err()
+        {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let image = temp.path().join("scan.jpg");
+        let source = temp.path().join("source.pdf");
+        let mirrored = temp.path().join("mirrored.pdf");
+        run(Command::new("magick")
+            .arg("-size")
+            .arg("2550x3508")
+            .arg("gradient:")
+            .arg(&image))?;
+        image_to_pdf(&image, &source)?;
+
+        mirror_page_to_pdf(&source, 1, &mirrored)?;
+
+        let images = pdfimages_list(&mirrored)?;
+        assert!(images.contains("2550  3508"), "{images}");
+        assert!(!images.contains("1600  2200"), "{images}");
+        Ok(())
+    }
+
+    #[test]
+    fn ls_lists_addable_files_and_directories() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("doc.pdf"), b"not checked here")?;
+        fs::write(temp.path().join("photo.JPG"), b"not checked here")?;
+        fs::write(temp.path().join("notes.txt"), b"not addable")?;
+        fs::create_dir(temp.path().join("folder"))?;
+
+        let args = Args {
+            pdf: None,
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+
+        command_line(
+            &mut state,
+            "kitty",
+            &format!(":ls {}", temp.path().display()),
+        )?;
+
+        let listing = state.listing_page.as_ref().expect("listing page");
+        let labels = listing
+            .entries
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"folder/"));
+        assert!(labels.contains(&"doc.pdf"));
+        assert!(labels.contains(&"photo.JPG"));
+        assert!(!labels.contains(&"notes.txt"));
+
+        let doc_idx = state
+            .listing_page
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .position(|entry| entry.label == "doc.pdf")
+            .unwrap();
+        state.listing_page.as_mut().unwrap().selected = doc_idx;
+        handle_listing_input(&mut state, "kitty", Input::Char(' '))?;
+        assert!(state
+            .listing_page
+            .as_ref()
+            .unwrap()
+            .marked
+            .contains(&doc_idx));
+        Ok(())
+    }
+
+    #[test]
+    fn add_directory_opens_picker() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("doc.pdf"), b"not checked here")?;
+
+        let args = Args {
+            pdf: None,
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+
+        command_line(
+            &mut state,
+            "kitty",
+            &format!(":add {}", temp.path().display()),
+        )?;
+
+        let listing = state.listing_page.as_ref().expect("listing page");
+        assert!(listing.entries.iter().any(|entry| entry.label == "doc.pdf"));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_new_compression_presets_and_legacy_aliases() -> Result<()> {
+        assert_eq!(compression_limits("strong")?.2, "strong");
+        assert_eq!(compression_limits("preview")?.2, "strong");
+        assert_eq!(compression_limits("screen")?.2, "strong");
+        assert_eq!(compression_limits("normal")?.2, "normal");
+        assert_eq!(compression_limits("email")?.2, "normal");
+        assert_eq!(compression_limits("medium")?.2, "normal");
+        assert_eq!(compression_limits("light")?.2, "light");
+        assert_eq!(compression_limits("archive")?.2, "light");
+        assert_eq!(compression_limits("print")?.2, "light");
+        assert!(compression_limits("tiny").is_err());
+        Ok(())
+    }
+
+    fn pdfimages_list(path: &Path) -> Result<String> {
+        let output = Command::new("pdfimages")
+            .arg("-list")
+            .arg(path)
+            .output()
+            .with_context(|| "run pdfimages -list")?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn solid_bitmap(width: usize, height: usize, rgba: [u8; 4]) -> Bitmap {
+        let stride = width * 4;
+        let mut data = vec![0_u8; stride * height];
+        for px in data.chunks_exact_mut(4) {
+            px[0] = rgba[2];
+            px[1] = rgba[1];
+            px[2] = rgba[0];
+            px[3] = rgba[3];
+        }
+        Bitmap {
+            width,
+            height,
+            stride,
+            data,
+        }
+    }
+
+    fn patterned_bitmap(width: usize, height: usize) -> Bitmap {
+        let stride = width * 4;
+        let mut data = vec![0_u8; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = y * stride + x * 4;
+                data[idx] = ((x * 17 + y * 3) % 251) as u8;
+                data[idx + 1] = ((x * 5 + y * 19) % 253) as u8;
+                data[idx + 2] = ((x * 11 + y * 7) % 247) as u8;
+                data[idx + 3] = 255;
+            }
+        }
+        Bitmap {
+            width,
+            height,
+            stride,
+            data,
+        }
     }
 }

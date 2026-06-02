@@ -47,34 +47,41 @@ Edit:
 - `M`: mirror the visible page
 - `d`: delete the visible page
 - `:move N`: move the selected pages, or the visible page if nothing is selected, before page `N`
+- `<` / `>` or `:back` / `:forward`: move selected pages, or the visible page, one slot
 - `c`: crop the visible page
-- `:compress screen|medium|print`: raster-compress selected pages, or the visible page
+- `:compress light|normal|strong`: lossy raster-compress selected pages, or the visible page
 
 Add:
 - `S` or `:scan [DPI]`: scan pages with `PDFVIEW_SCAN_COMMAND`
-- `:add image.jpg file.pdf`: append images or PDFs
+- `:add`: open the add picker in the current directory
+- `:add DIR`: open the add picker in `DIR`
+- `:add image.jpg file.pdf`: append images or PDFs directly
+- `:ls [DIR]`: open the add picker; `Space` marks multiple files, `Enter` adds marked files
 
 History:
 - `u` or `Ctrl-Z`: undo one edit
 - `U`: redo into the newest child edit
-- `:tree` or `:history`: show or hide the full history tree
+- `:tree` or `:history`: show or hide the full history tree; arrows move, `Enter` restores
 - `:goto N`: jump to a history node by number
 
 Help:
 - `:help`: show command and keybinding reference in the page area
 
 File:
-- `s`: save
-- `q`: quit
+- `s` or `:save` / `:w`: save
+- `:save-as PATH` or `:write PATH`: save to a new path and make it the current output
+- `q` or `:q` / `:quit` / `:exit`: quit
 
 Running `pdfview` with no file starts an empty document. Use `S` or `:scan`
 to create a multi-page scan, or `:add` to append image/PDF pages.
 
 ## Notes
 
-Rotate, delete, move, append, and save are structural PDF operations through
-`qpdf`. Crop and mirror rasterize affected pages, which matches the scanned
-document cleanup use case.
+Rotate, delete, move, append, crop, and save are structural PDF operations
+through `qpdf`. Mirror and compress rasterize affected pages. Compression
+presets are lossy: `strong` is smallest, `normal` is balanced, and `light`
+keeps the most detail. Legacy preset names `preview`, `email`, `archive`,
+`screen`, `medium`, and `print` still work as aliases.
 
 Scanning runs a shell command that receives the output PDF path as `$1` and
 optional DPI as `$2`.
