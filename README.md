@@ -45,7 +45,7 @@ Edit:
 - `r`: rotate the visible page right
 - `R`: rotate the visible page left
 - `M`: mirror the visible page
-- `d`: delete the visible page
+- `d`: delete the visible page; deleting the last page returns to an empty document
 - `:move N`: move the selected pages, or the visible page if nothing is selected, before page `N`
 - `<` / `>` or `:back` / `:forward`: move selected pages, or the visible page, one slot
 - `c`: crop the visible page
@@ -68,12 +68,18 @@ Help:
 - `:help`: show command and keybinding reference in the page area
 
 File:
-- `s` or `:save` / `:w`: save
-- `:save-as PATH` or `:write PATH`: save to a new path and make it the current output
+- `s` or `:save` / `:w`: save to the current output path
+- `:save examplename`: save as `examplename.pdf` in the current output directory
+- `:save PATH`: save to a new path and make it the current output; `.pdf` is added if omitted
+- `:save NAME DIR`: save as `DIR/NAME.pdf`, for example `:save 'Mieterhohung 2026' ~/Desktop`
+- `:rename NAME [DIR]`: rename or move the current output file/target
+- `:save-as PATH` or `:write PATH`: legacy aliases for `:save PATH`
 - `q` or `:q` / `:quit` / `:exit`: quit
 
 Running `pdfview` with no file starts an empty document. Use `S` or `:scan`
 to create a multi-page scan, or `:add` to append image/PDF pages.
+The header shows `*` when there are unsaved changes and `save -> PATH` for
+the current save target. That target may not exist yet until you save.
 
 ## Notes
 

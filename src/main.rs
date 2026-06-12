@@ -648,7 +648,7 @@ fn handle_action_input(state: &mut State, fmt: &str, input: Input) -> Result<UiA
             Ok(UiAction::Redraw)
         }
         Input::Char('s') => {
-            let result = save(state);
+            let result = save(state, None);
             handle_result(state, result);
             Ok(UiAction::Redraw)
         }
@@ -849,7 +849,7 @@ fn show(state: &mut State, fmt: &str) -> Result<()> {
             "{}",
             pad_to_cols(
                 &format!(
-                    "pdfview: empty document | selected 0 | {dirty} | out {}",
+                    "pdfview: empty document | selected 0 | {dirty} | save -> {}",
                     state.out.display()
                 ),
                 cols
@@ -1061,7 +1061,7 @@ fn print_header(state: &State, title: &str, dirty: &str, cols: u16) -> Result<()
         },
         cols,
     )?;
-    print_colored_segment(" | out ", Color::DarkGrey, cols)?;
+    print_colored_segment(" | save -> ", Color::DarkGrey, cols)?;
     print_colored_segment(&state.out.display().to_string(), Color::White, cols)?;
     execute!(io::stdout(), ResetColor)?;
     clear_to_end_of_line(cols)?;
@@ -1208,7 +1208,10 @@ fn print_help_page(cols: u16, rows: u16) -> Result<()> {
             Color::White,
         ),
         ("  u / Ctrl-Z / U        undo / redo", Color::White),
-        ("  s                     save", Color::White),
+        (
+            "  s                     save to current output path",
+            Color::White,
+        ),
         (
             "  q / x / Esc / Ctrl-C  quit, Esc closes help/tree/crop first",
             Color::White,
@@ -1220,7 +1223,20 @@ fn print_help_page(cols: u16, rows: u16) -> Result<()> {
             Color::White,
         ),
         (
-            "  :save-as PATH         save as PATH; .pdf is added if omitted",
+            "  :save NAME            save as NAME.pdf in current output dir",
+            Color::White,
+        ),
+        ("  :save NAME DIR        save as DIR/NAME.pdf", Color::White),
+        (
+            "  :save PATH            save to PATH; .pdf is added if omitted",
+            Color::White,
+        ),
+        (
+            "  :rename NAME [DIR]    rename/move current output file or target",
+            Color::White,
+        ),
+        (
+            "  :save-as PATH         legacy alias for :save PATH",
             Color::White,
         ),
         (
@@ -1624,8 +1640,9 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
             state.add_history("clear selection");
             Ok(())
         }
-        "save" | "w" if parts.len() == 1 => save(state),
-        "save-as" | "write" | "w" if parts.len() == 2 => save_as(state, PathBuf::from(&parts[1])),
+        "save" | "w" => save_command(state, &parts[1..]),
+        "save-as" | "write" => save_as_command(state, &parts[1..]),
+        "rename" | "ren" => rename_command(state, &parts[1..]),
         "q" | "quit" | "exit" | "close" => {
             std::process::exit(0);
         }
@@ -1724,7 +1741,12 @@ fn rotate(state: &mut State, degrees: i32, use_selection: bool) -> Result<()> {
 fn delete_pages(state: &mut State, use_selection: bool) -> Result<()> {
     let targets = state.targets(use_selection)?;
     if targets.len() == state.page_count {
-        bail!("cannot delete all pages");
+        state.current_pdf = None;
+        state.page_count = 0;
+        state.page = 0;
+        state.selected.clear();
+        state.clear_render_cache();
+        return state.record_snapshot("delete all pages");
     }
     let keep: Vec<usize> = (0..state.page_count)
         .filter(|p| !targets.contains(p))
@@ -2311,27 +2333,117 @@ fn redo(state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn save(state: &mut State) -> Result<()> {
+fn save_command(state: &mut State, args: &[String]) -> Result<()> {
+    let out = match args {
+        [] => None,
+        _ => Some(resolve_output_target(&state.out, args)?),
+    };
+    save(state, out)
+}
+
+fn save_as_command(state: &mut State, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: :save-as PATH");
+    }
+    let out = resolve_output_target(&state.out, args)?;
+    save(state, Some(out))
+}
+
+fn rename_command(state: &mut State, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: :rename NAME [DIR]");
+    }
+    let out = resolve_output_target(&state.out, args)?;
+    rename_output(state, out)
+}
+
+fn save(state: &mut State, out: Option<PathBuf>) -> Result<()> {
     let out = if state.overwrite {
-        state
-            .original
-            .as_ref()
-            .ok_or_else(|| anyhow!("no original path to overwrite"))?
-            .clone()
+        if out.is_some() {
+            state.overwrite = false;
+        }
+        out.unwrap_or_else(|| {
+            state
+                .original
+                .as_ref()
+                .expect("overwrite has original path")
+                .clone()
+        })
+    } else if let Some(out) = out {
+        out
     } else {
         state.out.clone()
     };
-    let _ = save_to_path(state, out)?;
-    Ok(())
-}
-
-fn save_as(state: &mut State, out: PathBuf) -> Result<()> {
-    let out = pdf_output_path(expand_path(out)?)?;
     if save_to_path(state, out.clone())? {
         state.out = out;
         state.overwrite = false;
     }
     Ok(())
+}
+
+fn rename_output(state: &mut State, out: PathBuf) -> Result<()> {
+    let out = pdf_output_path(expand_path(out)?)?;
+    if out == state.out {
+        state.message = format!("output already named {}", out.display());
+        return Ok(());
+    }
+    if state.out.exists() {
+        if out.exists()
+            && !confirm(&format!(
+                "Rename to {}? File exists; overwrite? [y/N] ",
+                out.display()
+            ))?
+        {
+            state.message = format!("rename cancelled: {}", out.display());
+            return Ok(());
+        }
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&state.out, &out)
+            .with_context(|| format!("rename {} to {}", state.out.display(), out.display()))?;
+        state.add_history(format!("rename: {}", out.display()));
+        state.message = format!("renamed to {}", out.display());
+    } else {
+        state.add_history(format!("rename target: {}", out.display()));
+        state.message = format!("output target renamed to {}", out.display());
+    }
+    state.out = out;
+    state.overwrite = false;
+    Ok(())
+}
+
+fn resolve_output_target(current_out: &Path, args: &[String]) -> Result<PathBuf> {
+    match args {
+        [] => bail!("usage: :save [PATH] or :save NAME DIR"),
+        [one] => {
+            let raw = PathBuf::from(one);
+            let expanded = expand_path(raw)?;
+            if expanded.exists() && expanded.is_dir() {
+                let file_name = current_out
+                    .file_name()
+                    .ok_or_else(|| anyhow!("current output path must include a file name"))?;
+                return pdf_output_path(expanded.join(file_name));
+            }
+            let target = if Path::new(one).components().count() == 1 {
+                current_out
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(one)
+            } else {
+                expanded
+            };
+            pdf_output_path(target)
+        }
+        [name, dir] => {
+            let name_path = Path::new(name);
+            if name_path.components().count() != 1 {
+                bail!("NAME must be a file name when DIR is provided");
+            }
+            pdf_output_path(expand_path(PathBuf::from(dir))?.join(name))
+        }
+        _ => bail!("usage: :save [PATH] or :save NAME DIR"),
+    }
 }
 
 fn pdf_output_path(path: PathBuf) -> Result<PathBuf> {
@@ -3471,7 +3583,11 @@ mod tests {
         let mut state = State::new(args, state_temp)?;
         let renamed = temp.path().join("renamed.pdf");
 
-        save_as(&mut state, renamed.clone())?;
+        command_line(
+            &mut state,
+            "kitty",
+            &format!(":save-as {}", renamed.display()),
+        )?;
 
         assert_eq!(state.out, renamed);
         assert!(!state.overwrite);
@@ -3502,10 +3618,140 @@ mod tests {
         let mut state = State::new(args, state_temp)?;
         let raw = temp.path().join("renamed");
 
-        save_as(&mut state, raw)?;
+        command_line(&mut state, "kitty", &format!(":save-as {}", raw.display()))?;
 
         assert_eq!(state.out, temp.path().join("renamed.pdf"));
         qpdf_check(&state.out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn save_command_accepts_name_and_directory() -> Result<()> {
+        if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.pdf");
+        let bitmap = solid_bitmap(320, 420, [255, 255, 255, 255]);
+        bitmap_to_pdf(&bitmap, &source)?;
+
+        let args = Args {
+            pdf: Some(source),
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+        let dir = temp.path().join("saved");
+
+        command_line(
+            &mut state,
+            "kitty",
+            &format!(":save 'Mieterhohung 2026' {}", dir.display()),
+        )?;
+
+        let expected = dir.join("Mieterhohung 2026.pdf");
+        assert_eq!(state.out, expected);
+        assert!(state.out.exists());
+        assert!(!state.dirty);
+        qpdf_check(&state.out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn save_command_accepts_bare_name_in_current_output_dir() -> Result<()> {
+        if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.pdf");
+        let bitmap = solid_bitmap(320, 420, [255, 255, 255, 255]);
+        bitmap_to_pdf(&bitmap, &source)?;
+
+        let args = Args {
+            pdf: Some(source),
+            page: 1,
+            out: Some(temp.path().join("nested").join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+
+        command_line(&mut state, "kitty", ":save examplename")?;
+
+        assert_eq!(
+            state.out,
+            temp.path().join("nested").join("examplename.pdf")
+        );
+        assert!(state.out.exists());
+        qpdf_check(&state.out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rename_moves_saved_output_file() -> Result<()> {
+        if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.pdf");
+        let bitmap = solid_bitmap(320, 420, [255, 255, 255, 255]);
+        bitmap_to_pdf(&bitmap, &source)?;
+
+        let args = Args {
+            pdf: Some(source),
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+        save(&mut state, None)?;
+        let old = state.out.clone();
+
+        command_line(&mut state, "kitty", ":rename renamed")?;
+
+        assert!(!old.exists());
+        assert_eq!(state.out, temp.path().join("renamed.pdf"));
+        assert!(state.out.exists());
+        qpdf_check(&state.out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_only_page_returns_to_empty_document_and_can_undo() -> Result<()> {
+        if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.pdf");
+        let bitmap = solid_bitmap(320, 420, [255, 255, 255, 255]);
+        bitmap_to_pdf(&bitmap, &source)?;
+
+        let args = Args {
+            pdf: Some(source),
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+
+        delete_pages(&mut state, true)?;
+
+        assert_eq!(state.page_count, 0);
+        assert!(state.current_pdf.is_none());
+        assert!(state.dirty);
+        assert!(save(&mut state, None).is_err());
+
+        undo(&mut state)?;
+        assert_eq!(state.page_count, 1);
+        qpdf_check(state.current_pdf()?)?;
         Ok(())
     }
 
