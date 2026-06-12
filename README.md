@@ -80,6 +80,7 @@ Running `pdfview` with no file starts an empty document. Use `S` or `:scan`
 to create a multi-page scan, or `:add` to append image/PDF pages.
 The header shows `*` when there are unsaved changes and `save -> PATH` for
 the current save target. That target may not exist yet until you save.
+Saved PDFs are rewritten through `qpdf` with a minimum PDF version of 1.7.
 
 ## Notes
 

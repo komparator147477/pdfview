@@ -23,6 +23,7 @@ use tempfile::{Builder, TempDir};
 
 const IMAGE_IMPORT_DPI: &str = "300";
 const RASTER_EDIT_DPI: f64 = 300.0;
+const SAVED_PDF_MIN_VERSION: &str = "1.7";
 const IMAGE_EXTENSIONS: &[&str] = &[
     "bmp", "gif", "jfif", "jp2", "jpe", "jpeg", "jpg", "jpx", "pam", "pbm", "pgm", "png", "pnm",
     "ppm", "psd", "tif", "tiff", "webp",
@@ -1238,6 +1239,10 @@ fn print_help_page(cols: u16, rows: u16) -> Result<()> {
         (
             "  :save-as PATH         legacy alias for :save PATH",
             Color::White,
+        ),
+        (
+            "                        saved PDFs are written as PDF 1.7+",
+            Color::DarkGrey,
         ),
         (
             "  :add [FILE...|DIR]    add files, or open picker when empty/dir",
@@ -2481,7 +2486,7 @@ fn save_to_path(state: &mut State, out: PathBuf) -> Result<bool> {
         ))
         .suffix(".pdf")
         .tempfile_in(out.parent().unwrap_or_else(|| Path::new(".")))?;
-    fs::copy(current, tmp.path())?;
+    write_saved_pdf(current, tmp.path())?;
     qpdf_check(tmp.path())?;
     tmp.persist(&out).map_err(|e| anyhow!(e.error))?;
     state.saved_snapshot = state.current_snapshot;
@@ -2489,6 +2494,14 @@ fn save_to_path(state: &mut State, out: PathBuf) -> Result<bool> {
     state.message = format!("saved to {}; qpdf ok", out.display());
     state.add_history(format!("save: {}", out.display()));
     Ok(true)
+}
+
+fn write_saved_pdf(input: &Path, output: &Path) -> Result<()> {
+    run(Command::new("qpdf")
+        .arg("--warning-exit-0")
+        .arg(format!("--min-version={SAVED_PDF_MIN_VERSION}"))
+        .arg(input)
+        .arg(output))
 }
 
 struct Bitmap {
@@ -3692,6 +3705,32 @@ mod tests {
     }
 
     #[test]
+    fn saved_pdf_uses_minimum_supported_pdf_version() -> Result<()> {
+        if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.pdf");
+        let bitmap = solid_bitmap(320, 420, [255, 255, 255, 255]);
+        bitmap_to_pdf(&bitmap, &source)?;
+
+        let args = Args {
+            pdf: Some(source),
+            page: 1,
+            out: Some(temp.path().join("out.pdf")),
+            overwrite: false,
+            format: Some("kitty".into()),
+        };
+        let state_temp = tempfile::tempdir()?;
+        let mut state = State::new(args, state_temp)?;
+
+        save(&mut state, None)?;
+
+        assert_eq!(pdf_version(&state.out)?, SAVED_PDF_MIN_VERSION);
+        Ok(())
+    }
+
+    #[test]
     fn rename_moves_saved_output_file() -> Result<()> {
         if require_tool("qpdf").is_err() || require_tool("pdfinfo").is_err() {
             return Ok(());
@@ -3975,6 +4014,23 @@ mod tests {
             bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn pdf_version(path: &Path) -> Result<String> {
+        let output = Command::new("pdfinfo")
+            .arg(path)
+            .output()
+            .with_context(|| "run pdfinfo")?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(raw) = line.strip_prefix("PDF version:") {
+                return Ok(raw.trim().to_string());
+            }
+        }
+        bail!("pdfinfo did not report PDF version");
     }
 
     fn solid_bitmap(width: usize, height: usize, rgba: [u8; 4]) -> Bitmap {
