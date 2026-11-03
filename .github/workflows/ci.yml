@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed git rust qpdf poppler-glib cairo imagemagick
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Test
+        run: cargo test --locked
+      - name: Build release
+        run: cargo build --release --locked

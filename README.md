@@ -1,6 +1,46 @@
 # pdfview
 
-Terminal PDF inspection and cleanup for scanned documents.
+View and clean up scanned PDFs in your terminal. Built in Rust with native
+Poppler/Cairo rendering and the Kitty graphics protocol, for Kitty and Ghostty
+on Linux.
+
+- Rotate, crop, mirror, delete, and reorder pages.
+- Select multiple pages, append images or PDFs, and scan new pages.
+- Undo and redo edits with a branching history tree.
+- Save structural edits without rasterizing pages; optionally compress scans.
+
+## Install
+
+You need Rust and Cargo, Poppler with GLib bindings, Cairo, `qpdf`, and `pdfinfo`
+(from Poppler). Image import also requires ImageMagick 7 (`magick`).
+
+On Arch Linux:
+
+```bash
+sudo pacman -S --needed rust poppler-glib cairo qpdf imagemagick
+```
+
+On Debian/Ubuntu, install Rust and Cargo and the native build dependencies:
+
+```bash
+sudo apt install build-essential libpoppler-glib-dev libcairo2-dev qpdf poppler-utils
+```
+
+For image import, install ImageMagick 7 separately if your distribution only
+provides ImageMagick 6 (`convert`).
+
+Then build and install from the repository:
+
+```bash
+git clone https://github.com/komparator147477/pdfview.git
+cd pdfview
+cargo install --path . --locked
+```
+
+Cargo installs `pdfview` into `~/.cargo/bin`; make sure that directory is on
+your `PATH`.
+
+## Usage
 
 ```bash
 pdfview file.pdf
@@ -10,17 +50,9 @@ pdfview file.pdf --out cleaned.pdf
 pdfview file.pdf --overwrite
 ```
 
-This version is a Rust CLI with native Poppler/Cairo page rendering and direct
-Kitty/Ghostty image output. Required tools: `qpdf` and `pdfinfo`. Optional
-workflow tools: `magick` for image import and `PDFVIEW_SCAN_COMMAND` for
-scanner integration.
-
-Build and install locally:
-
-```bash
-cargo build --release
-~/.zshrc: pdfview() { ~/coding/pdfview/target/release/pdfview "$@"; }
-```
+By default, saving `file.pdf` writes `file-edited.pdf` beside the input.
+Use `--out` to choose another path or `--overwrite` to save to the input path.
+Edits are kept in a temporary document until you save.
 
 ## Controls
 
@@ -90,10 +122,38 @@ presets are lossy: `strong` is smallest, `normal` is balanced, and `light`
 keeps the most detail. Legacy preset names `preview`, `email`, `archive`,
 `screen`, `medium`, and `print` still work as aliases.
 
-Scanning runs a shell command that receives the output PDF path as `$1` and
-optional DPI as `$2`.
-Override it with `PDFVIEW_SCAN_COMMAND`; by default pdfview runs:
+## Scanning
+
+Scanning requires `zsh`, `sudo`, and a command that produces a PDF. Set
+`PDFVIEW_SCAN_COMMAND` to the command for your scanner. It receives the output
+PDF path as `$1` and optional DPI as `$2` (an empty string when omitted):
+
+```bash
+export PDFVIEW_SCAN_COMMAND='/path/to/scan-to-pdf "$1" "$2"'
+```
+
+The command runs through `zsh -lc`. Before scanning, pdfview runs `sudo -v`
+and may prompt for your password, even if your scan command does not use sudo.
+
+The default is a personal `hpscan` integration and requires a separate local
+script; configure the environment variable for your own setup:
 
 ```bash
 source ~/coding/hpscan/hpscan.zsh && hpscan "$1" "$2"
 ```
+
+## Development
+
+```bash
+cargo fmt --check
+cargo test --locked
+cargo build --release --locked
+```
+
+Tests create their own temporary documents. Tests that need external PDF tools
+or `magick` return early when those tools are missing. CI runs on Arch Linux
+with the PDF tools and ImageMagick 7 installed.
+
+## License
+
+[MIT](LICENSE)

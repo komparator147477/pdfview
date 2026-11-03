@@ -2,6 +2,10 @@
 name = "pdfview"
 version = "0.1.0"
 edition = "2021"
+description = "Terminal PDF viewer and editor for scanned document cleanup"
+repository = "https://github.com/komparator147477/pdfview"
+readme = "README.md"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
