@@ -9,12 +9,12 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: archlinux:base-devel
     steps:
       - name: Install dependencies
         run: pacman -Syu --noconfirm --needed git rust qpdf poppler-glib cairo imagemagick
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Check formatting
         run: cargo fmt --check
       - name: Test
