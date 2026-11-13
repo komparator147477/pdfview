@@ -1,3 +1,9 @@
+mod actions;
+mod config;
+mod printing;
+mod scanning;
+mod ui;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{c_char, c_double, c_int, c_void, CString, OsStr};
 use std::fs;
@@ -10,13 +16,16 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
+use crossterm::style::ResetColor;
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use serde_json::Value;
 use tempfile::{Builder, TempDir};
@@ -87,7 +96,7 @@ struct PageBox {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Terminal PDF viewer/editor for scanned PDF cleanup.")]
+#[command(version, about = "Terminal PDF viewer/editor for scanned PDF cleanup.")]
 struct Args {
     pdf: Option<PathBuf>,
     #[arg(long, default_value_t = 1)]
@@ -98,6 +107,11 @@ struct Args {
     overwrite: bool,
     #[arg(long, value_parser = ["kitty"])]
     format: Option<String>,
+    /// Start scanning immediately, then review/save in the viewer.
+    #[arg(long)]
+    scan: bool,
+    #[arg(long, requires = "scan")]
+    scan_dpi: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -127,7 +141,16 @@ struct State {
     next_snapshot: usize,
     show_tree_page: bool,
     tree_cursor: usize,
-    show_help_page: bool,
+    config: config::Config,
+    ui: Option<ui::Runtime>,
+    help: Option<actions::Help>,
+    command: Option<actions::LineInput>,
+    command_history: Vec<String>,
+    command_history_cursor: Option<usize>,
+    prefix: Option<char>,
+    print_dialog: Option<printing::Dialog>,
+    scan: Option<scanning::Session>,
+    scan_device: Option<scanning::CachedDevice>,
     listing_page: Option<ListingPage>,
     crop_preview: Option<CropPreview>,
     render_cache: Arc<Mutex<HashMap<RenderKey, Vec<u8>>>>,
@@ -236,7 +259,16 @@ impl State {
             next_snapshot: 1,
             show_tree_page: false,
             tree_cursor: 0,
-            show_help_page: false,
+            config: config::Config::default(),
+            ui: None,
+            help: None,
+            command: None,
+            command_history: Vec::new(),
+            command_history_cursor: None,
+            prefix: None,
+            print_dialog: None,
+            scan: None,
+            scan_device: None,
             listing_page: None,
             crop_preview: None,
             render_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -404,6 +436,7 @@ enum Input {
     Char(char),
     Enter,
     Tab,
+    BackTab,
     Esc,
     CtrlC,
     CtrlZ,
@@ -414,6 +447,15 @@ enum Input {
     WheelUp,
     WheelDown,
     Backspace,
+    Ctrl(char),
+    Alt(char),
+    Function(u8),
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Resize,
     Unknown,
 }
 
@@ -425,38 +467,22 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         if io::stdin().is_terminal() && io::stdout().is_terminal() {
             terminal::enable_raw_mode()?;
-            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
-            Ok(Self { active: true })
+            let guard = Self { active: true };
+            execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                Hide,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )?;
+            Ok(guard)
         } else {
             Ok(Self { active: false })
         }
     }
-}
-
-fn enter_scan_screen() -> Result<()> {
-    terminal::disable_raw_mode().ok();
-    clear_terminal_images("kitty")?;
-    execute!(
-        io::stdout(),
-        Show,
-        MoveTo(0, 0),
-        Clear(ClearType::All),
-        SetForegroundColor(Color::Green)
-    )?;
-    println!("pdfview scan");
-    execute!(io::stdout(), ResetColor)?;
-    println!("Scanner output follows. Password/progress prompts are handled here.");
-    println!();
-    io::stdout().flush()?;
-    Ok(())
-}
-
-fn leave_scan_screen() -> Result<()> {
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        terminal::enable_raw_mode()?;
-        execute!(io::stdout(), Hide, MoveTo(0, 0), Clear(ClearType::All))?;
-    }
-    Ok(())
 }
 
 impl Drop for TerminalGuard {
@@ -467,9 +493,12 @@ impl Drop for TerminalGuard {
                 Clear(ClearType::All),
                 DisableMouseCapture,
                 Show,
+                ResetColor,
+                PopKeyboardEnhancementFlags,
                 LeaveAlternateScreen
             );
-            let _ = io::stdout().write_all(b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b_Ga=d,d=a,q=2;\x1b\\");
+            let _ = io::stdout()
+                .write_all(b"\x1b[?2026l\x1b_Ga=d,d=A,q=2;\x1b\\\x1b_Ga=d,d=a,q=2;\x1b\\");
             let _ = terminal::disable_raw_mode();
         }
     }
@@ -481,8 +510,14 @@ fn main() -> Result<()> {
     require_tool("pdfinfo")?;
 
     let fmt = args.format.clone().unwrap_or_else(native_format);
+    let scan = args.scan;
+    let scan_dpi = args.scan_dpi;
     let temp = tempfile::tempdir()?;
     let mut state = State::new(args, temp)?;
+    state.config = config::Config::load()?;
+    if scan {
+        scan_pages(&mut state, scan_dpi)?;
+    }
     run_ui(&mut state, &fmt)
 }
 
@@ -491,24 +526,18 @@ fn run_ui(state: &mut State, fmt: &str) -> Result<()> {
     let mut redraw = true;
     loop {
         if redraw {
-            if let Err(err) = show(state, fmt) {
+            if let Err(err) = ui::show(state, fmt) {
                 state.message = err.to_string();
             }
-            redraw = false;
         }
-        if state.message.is_empty() {
-            redraw = current_page_render_is_ready(state, fmt);
-        }
+        redraw = current_page_render_is_ready(state, fmt);
         if redraw {
             continue;
         }
-        match read_input()? {
-            input if handle_navigation_input(state, input) => redraw = true,
-            input => match handle_action_input(state, fmt, input)? {
-                UiAction::Redraw => redraw = true,
-                UiAction::Noop => redraw = false,
-                UiAction::Quit => return Ok(()),
-            },
+        match handle_input(state, fmt, read_input()?)? {
+            UiAction::Redraw => redraw = true,
+            UiAction::Noop => redraw = false,
+            UiAction::Quit => return Ok(()),
         }
     }
 }
@@ -519,148 +548,255 @@ enum UiAction {
     Quit,
 }
 
-fn handle_navigation_input(state: &mut State, input: Input) -> bool {
-    if state.crop_preview.is_some() {
-        return false;
+fn execute_action(state: &mut State, fmt: &str, command: &str) -> Result<UiAction> {
+    if command.ends_with(' ') {
+        state.command = Some(actions::LineInput::new(command));
+        state.command_history_cursor = None;
+        return Ok(UiAction::Redraw);
     }
-    if state.listing_page.is_some() {
-        return false;
-    }
-    if (state.show_tree_page || state.show_help_page || state.listing_page.is_some())
-        && matches!(
-            input,
-            Input::Char('n')
-                | Input::Char(' ')
-                | Input::Right
-                | Input::Char('p')
-                | Input::Left
-                | Input::Char('g')
-                | Input::Char('G')
-        )
-    {
-        state.show_tree_page = false;
-        state.show_help_page = false;
-        state.listing_page = None;
-        return true;
-    }
-    let old_page = state.page;
-    match input {
-        Input::Up | Input::Down => return false,
-        Input::Char('n') | Input::Char(' ') | Input::Right | Input::WheelDown => {
-            if state.page_count > 0 {
-                state.page = (state.page + 1).min(state.page_count - 1);
-            }
+    match command_line(state, fmt, command) {
+        Ok(action) => Ok(action),
+        Err(error) => {
+            state.message = error.to_string();
+            Ok(UiAction::Redraw)
         }
-        Input::Char('p') | Input::Left | Input::WheelUp => {
-            state.page = state.page.saturating_sub(1);
-        }
-        Input::Char('g') => state.page = 0,
-        Input::Char('G') => {
-            if state.page_count > 0 {
-                state.page = state.page_count - 1;
-            }
-        }
-        _ => return false,
     }
-    state.page != old_page
 }
 
-fn handle_action_input(state: &mut State, fmt: &str, input: Input) -> Result<UiAction> {
+fn handle_input(state: &mut State, fmt: &str, input: Input) -> Result<UiAction> {
+    if state.scan.is_some() {
+        return handle_scan_input(state, input);
+    }
+    let printer_changed = state
+        .print_dialog
+        .as_mut()
+        .is_some_and(printing::Dialog::poll);
+    if matches!(input, Input::Unknown) && !printer_changed {
+        return Ok(UiAction::Noop);
+    }
+    if matches!(input, Input::Resize) {
+        state.clear_render_cache();
+        if let Some(ui) = &mut state.ui {
+            ui.invalidate();
+        }
+        return Ok(UiAction::Redraw);
+    }
+    if let Some(mut dialog) = state.print_dialog.take() {
+        let input = if dialog.editing.is_none() {
+            actions::normal_input(input)
+        } else {
+            input
+        };
+        let event = if matches!(input, Input::Unknown) && dialog.pending_submit && !dialog.loading()
+        {
+            printing::DialogEvent::Submit
+        } else {
+            dialog.input(input)
+        };
+        match event {
+            printing::DialogEvent::Cancel => {}
+            printing::DialogEvent::Continue => state.print_dialog = Some(dialog),
+            printing::DialogEvent::Submit => {
+                match print_document(state, &dialog.options, &dialog.caps) {
+                    Ok(()) => {
+                        state.config.printing = dialog.options;
+                        state.config.printing.pages = "all".into();
+                    }
+                    Err(error) => {
+                        dialog.error = error.to_string();
+                        state.print_dialog = Some(dialog);
+                    }
+                }
+            }
+        }
+        return Ok(UiAction::Redraw);
+    }
+    if let Some(mut help) = state.help.take() {
+        let indices = actions::matching(&help.query.text);
+        match input {
+            Input::Esc | Input::CtrlC | Input::Function(1) => {}
+            Input::Enter => {
+                if let Some(&index) = indices.get(help.selected) {
+                    state.command = None;
+                    return execute_action(state, fmt, actions::ACTIONS[index].command);
+                }
+                state.help = Some(help);
+            }
+            _ => {
+                match input {
+                    Input::Up | Input::Ctrl('p') | Input::WheelUp => {
+                        help.selected = help.selected.saturating_sub(1)
+                    }
+                    Input::Down | Input::Ctrl('n') | Input::WheelDown => {
+                        help.selected = (help.selected + 1).min(indices.len().saturating_sub(1))
+                    }
+                    Input::PageUp => help.selected = help.selected.saturating_sub(10),
+                    Input::PageDown => {
+                        help.selected = (help.selected + 10).min(indices.len().saturating_sub(1))
+                    }
+                    _ => {
+                        if help.query.edit(input) {
+                            help.selected = 0;
+                        }
+                    }
+                }
+                state.help = Some(help);
+            }
+        }
+        return Ok(UiAction::Redraw);
+    }
+    if let Some(mut command) = state.command.take() {
+        match input {
+            Input::Esc | Input::CtrlC => {}
+            Input::Function(1) => {
+                state.help = Some(actions::Help::default());
+            }
+            Input::Enter => {
+                if !command.text.trim().is_empty() {
+                    if state.command_history.last() != Some(&command.text) {
+                        state.command_history.push(command.text.clone());
+                    }
+                    return execute_action(state, fmt, command.text.trim());
+                }
+            }
+            _ => {
+                match input {
+                    Input::Tab => {
+                        let matches: std::collections::BTreeSet<&str> = actions::ACTIONS
+                            .iter()
+                            .filter_map(|a| {
+                                a.command
+                                    .split_whitespace()
+                                    .next()
+                                    .filter(|name| name.starts_with(&command.text))
+                            })
+                            .collect();
+                        if matches.len() == 1 {
+                            command =
+                                actions::LineInput::new(format!("{} ", matches.first().unwrap()));
+                        }
+                    }
+                    Input::Up => {
+                        let cursor = state
+                            .command_history_cursor
+                            .unwrap_or(state.command_history.len())
+                            .saturating_sub(1);
+                        if let Some(text) = state.command_history.get(cursor) {
+                            command = actions::LineInput::new(text);
+                            state.command_history_cursor = Some(cursor);
+                        }
+                    }
+                    Input::Down => {
+                        let cursor = (state
+                            .command_history_cursor
+                            .unwrap_or(state.command_history.len())
+                            + 1)
+                        .min(state.command_history.len());
+                        command = actions::LineInput::new(
+                            state
+                                .command_history
+                                .get(cursor)
+                                .cloned()
+                                .unwrap_or_default(),
+                        );
+                        state.command_history_cursor = Some(cursor);
+                    }
+                    _ => {
+                        command.edit(input);
+                    }
+                }
+                state.command = Some(command);
+            }
+        }
+        return Ok(UiAction::Redraw);
+    }
+    let input = actions::normal_input(input);
+    if let Some(prefix) = state.prefix.take() {
+        let command = match (prefix, input) {
+            ('z', Input::Char('n')) => Some("compress normal"),
+            ('z', Input::Char('l')) => Some("compress light"),
+            ('z', Input::Char('s')) => Some("compress strong"),
+            ('Z', Input::Char('Z')) => Some("wq"),
+            ('Z', Input::Char('Q')) => Some("q!"),
+            _ => None,
+        };
+        if let Some(command) = command {
+            return execute_action(state, fmt, command);
+        }
+        return Ok(UiAction::Redraw);
+    }
+    match input {
+        Input::Char(':') => return prompt_command(state, fmt),
+        Input::Function(1) | Input::Char('?') => return execute_action(state, fmt, "help"),
+        Input::Ctrl('p') => return execute_action(state, fmt, "print"),
+        Input::Alt('p') => return execute_action(state, fmt, "print!"),
+        Input::Function(5) => return execute_action(state, fmt, "reload"),
+        Input::CtrlC => return execute_action(state, fmt, "q"),
+        _ => {}
+    }
     if state.listing_page.is_some() {
         return handle_listing_input(state, fmt, input);
     }
     if state.show_tree_page {
+        if matches!(input, Input::Char('t')) {
+            state.show_tree_page = false;
+            return Ok(UiAction::Redraw);
+        }
         return handle_tree_input(state, fmt, input);
     }
-    match input {
-        Input::Esc
-            if state.show_tree_page || state.show_help_page || state.listing_page.is_some() =>
-        {
-            state.show_tree_page = false;
-            state.show_help_page = false;
-            state.listing_page = None;
-            Ok(UiAction::Redraw)
+    if matches!(input, Input::Char('z' | 'Z')) {
+        if let Input::Char(prefix) = input {
+            state.prefix = Some(prefix);
         }
-        Input::CtrlC | Input::Esc | Input::Char('q') | Input::Char('x') => Ok(UiAction::Quit),
-        Input::Char('o') => {
-            let result = go_to_page_prompt(state);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('m') => {
-            if state.page_count > 0 {
-                if !state.selected.insert(state.page) {
-                    state.selected.remove(&state.page);
-                    state.add_history(format!("unselected: page {}", state.page + 1));
-                } else {
-                    state.add_history(format!("selected: page {}", state.page + 1));
-                }
-            }
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('r') => {
-            let result = rotate(state, 90, true);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('R') => {
-            let result = rotate(state, -90, true);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('M') => {
-            let result = mirror(state, true);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('d') => {
-            let result = delete_pages(state, true);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('<') => {
-            let result = move_pages_by(state, -1);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('>') => {
-            let result = move_pages_by(state, 1);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('c') => {
-            let result = crop_pages(state, fmt, true);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('S') => {
-            let result = scan_pages(state, None);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('u') | Input::CtrlZ => {
-            let result = undo(state);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('U') => {
-            let result = redo(state);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char('s') => {
-            let result = save(state, None);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        Input::Char(':') => {
-            let line = prompt(":")?;
-            let result = command_line(state, fmt, &line);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
-        _ => Ok(UiAction::Noop),
+        return Ok(UiAction::Redraw);
     }
+    if let Some(command) = actions::binding(input) {
+        state.message.clear();
+        return execute_action(state, fmt, command);
+    }
+    Ok(UiAction::Noop)
+}
+
+fn print_pages(options: &printing::PrintOptions, state: &State) -> Result<Vec<usize>> {
+    if state.page_count == 0 {
+        bail!("no pages to print");
+    }
+    match options.pages.trim() {
+        "all" => Ok((0..state.page_count).collect()),
+        "current" => Ok(vec![state.page]),
+        "selected" | "selection" => {
+            if state.selected.is_empty() {
+                bail!("no marked pages; choose all, current, or a page range");
+            }
+            Ok(state.selected.iter().copied().collect())
+        }
+        range => Ok(parse_pages(range, state.page_count)?.into_iter().collect()),
+    }
+}
+
+fn print_document(
+    state: &mut State,
+    options: &printing::PrintOptions,
+    caps: &printing::Capabilities,
+) -> Result<()> {
+    let pages = print_pages(options, state)?;
+    let current = state.current_pdf()?.to_path_buf();
+    let subset = state.temp.path().join("print-pages.pdf");
+    let pdf = if pages == (0..state.page_count).collect::<Vec<_>>() {
+        &current
+    } else {
+        rebuild_from_ranges(&current, &pages, &subset)?;
+        &subset
+    };
+    let title = state
+        .original
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .unwrap_or_else(|| OsStr::new("pdfview document"))
+        .to_string_lossy();
+    let result = printing::submit(options, caps, &title, pdf)?;
+    state.message = format!("Print queued · {result}");
+    Ok(())
 }
 
 fn handle_listing_input(state: &mut State, fmt: &str, input: Input) -> Result<UiAction> {
@@ -688,10 +824,9 @@ fn handle_listing_input(state: &mut State, fmt: &str, input: Input) -> Result<Ui
                     .entries
                     .get(listing.selected)
                     .is_some_and(|entry| entry.kind == ListingEntryKind::File)
+                    && !listing.marked.insert(listing.selected)
                 {
-                    if !listing.marked.insert(listing.selected) {
-                        listing.marked.remove(&listing.selected);
-                    }
+                    listing.marked.remove(&listing.selected);
                 }
             }
             Ok(UiAction::Redraw)
@@ -701,12 +836,7 @@ fn handle_listing_input(state: &mut State, fmt: &str, input: Input) -> Result<Ui
             handle_result(state, result);
             Ok(UiAction::Redraw)
         }
-        Input::Char(':') => {
-            let line = prompt(":")?;
-            let result = command_line(state, fmt, &line);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
+        Input::Char(':') => prompt_command(state, fmt),
         _ => Ok(UiAction::Noop),
     }
 }
@@ -731,33 +861,27 @@ fn handle_tree_input(state: &mut State, fmt: &str, input: Input) -> Result<UiAct
             handle_result(state, result);
             Ok(UiAction::Redraw)
         }
-        Input::Char(':') => {
-            let line = prompt(":")?;
-            let result = command_line(state, fmt, &line);
-            handle_result(state, result);
-            Ok(UiAction::Redraw)
-        }
+        Input::Char(':') => prompt_command(state, fmt),
         _ => Ok(UiAction::Noop),
     }
 }
 
 fn current_page_render_is_ready(state: &State, fmt: &str) -> bool {
-    if state.show_tree_page || state.show_help_page || state.listing_page.is_some() {
+    if state.show_tree_page
+        || state.help.is_some()
+        || state.print_dialog.is_some()
+        || state.scan.is_some()
+        || state.listing_page.is_some()
+    {
         return false;
     }
     let (cols, rows) = terminal::size().unwrap_or((100, 40));
-    let footer_lines = if state.crop_preview.is_some() {
-        2 + usize::from(!state.history.is_empty())
-    } else {
-        3 + usize::from(!state.history.is_empty())
-    };
-    let footer_start = rows.saturating_sub(footer_lines as u16).max(3);
-    let image_rows = footer_start.saturating_sub(2).max(5);
+    let area = ui::document_area(ratatui::layout::Rect::new(0, 0, cols, rows));
     let key = RenderKey {
         snapshot: state.current_snapshot,
         page: state.page,
-        cols,
-        rows: image_rows,
+        cols: area.width,
+        rows: area.height,
         format: fmt.to_string(),
     };
     state.last_rendered_key.as_ref() != Some(&key)
@@ -773,383 +897,65 @@ fn handle_result(state: &mut State, result: Result<()>) {
     }
 }
 
+fn input_from_event(event: Event) -> Input {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Release => Input::Unknown,
+        Event::Key(key) => match key.code {
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match actions::shortcut_char(c) {
+                    'c' => Input::CtrlC,
+                    'z' => Input::CtrlZ,
+                    'p' if key.kind == KeyEventKind::Repeat => Input::Unknown,
+                    key => Input::Ctrl(key),
+                }
+            }
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
+                let c = actions::shortcut_char(c);
+                if c == 'p' && key.kind == KeyEventKind::Repeat {
+                    Input::Unknown
+                } else {
+                    Input::Alt(c)
+                }
+            }
+            KeyCode::Char(c) => Input::Char(c),
+            KeyCode::F(number) => Input::Function(number),
+            KeyCode::Enter => Input::Enter,
+            KeyCode::Tab => Input::Tab,
+            KeyCode::BackTab => Input::BackTab,
+            KeyCode::Esc => Input::Esc,
+            KeyCode::Left => Input::Left,
+            KeyCode::Right => Input::Right,
+            KeyCode::Up => Input::Up,
+            KeyCode::Down => Input::Down,
+            KeyCode::Backspace => Input::Backspace,
+            KeyCode::Delete => Input::Delete,
+            KeyCode::Home => Input::Home,
+            KeyCode::End => Input::End,
+            KeyCode::PageUp => Input::PageUp,
+            KeyCode::PageDown => Input::PageDown,
+            _ => Input::Unknown,
+        },
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollDown => Input::WheelDown,
+            MouseEventKind::ScrollUp => Input::WheelUp,
+            _ => Input::Unknown,
+        },
+        Event::Resize(_, _) => Input::Resize,
+        _ => Input::Unknown,
+    }
+}
+
 fn read_input() -> Result<Input> {
     if !io::stdin().is_terminal() {
         let mut buf = String::new();
         io::stdin().read_line(&mut buf)?;
         return Ok(Input::Char('q'));
     }
-    loop {
-        if event::poll(Duration::from_millis(500))? {
-            return match event::read()? {
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                }) => Ok(Input::CtrlC),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('z'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                }) => Ok(Input::CtrlZ),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char(c),
-                    ..
-                }) => Ok(Input::Char(c)),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                }) => Ok(Input::Enter),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Tab, ..
-                }) => Ok(Input::Tab),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Esc, ..
-                }) => Ok(Input::Esc),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Left,
-                    ..
-                }) => Ok(Input::Left),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Right,
-                    ..
-                }) => Ok(Input::Right),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Up, ..
-                }) => Ok(Input::Up),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Down,
-                    ..
-                }) => Ok(Input::Down),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Backspace,
-                    ..
-                }) => Ok(Input::Backspace),
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollDown => Ok(Input::WheelDown),
-                    MouseEventKind::ScrollUp => Ok(Input::WheelUp),
-                    _ => Ok(Input::Unknown),
-                },
-                _ => Ok(Input::Unknown),
-            };
-        }
-    }
-}
-
-fn show(state: &mut State, fmt: &str) -> Result<()> {
-    let (cols, rows) = terminal::size().unwrap_or((100, 40));
-    let dirty = if state.dirty { "*" } else { "-" };
-    if state.page_count == 0 {
-        let footer_lines = 2 + usize::from(!state.history.is_empty());
-        let footer_start = rows.saturating_sub(footer_lines as u16).max(3);
-        let page_rows = footer_start.saturating_sub(1).max(1);
-        begin_sync_update()?;
-        clear_terminal_images(fmt)?;
-        execute!(io::stdout(), MoveTo(0, 0), Clear(ClearType::All))?;
-        print!(
-            "{}",
-            pad_to_cols(
-                &format!(
-                    "pdfview: empty document | selected 0 | {dirty} | save -> {}",
-                    state.out.display()
-                ),
-                cols
-            )
-        );
-        execute!(io::stdout(), MoveTo(0, 1))?;
-        if state.show_tree_page {
-            print_tree_page(state, cols, page_rows)?;
-        } else if state.show_help_page {
-            print_help_page(cols, page_rows)?;
-        } else if let Some(listing) = &state.listing_page {
-            print_listing_page(listing, cols, page_rows)?;
-        }
-        let footer = if state.listing_page.is_some() {
-            "List: Up/Down move, Space mark, Enter add/open, Esc close | :add FILE still works"
-        } else if state.show_tree_page {
-            "Tree: Up/Down move, Enter restore, Esc close | :goto N still works"
-        } else {
-            "New: S scan, :add files, :ls files | Help: :help | Undo: u/^Z, U, :tree, :goto N | File: s save, q quit"
-        };
-        print_footer(state, cols, rows, footer)?;
-        end_sync_update()?;
-        return Ok(());
-    }
-
-    let footer_lines = 3 + usize::from(!state.history.is_empty());
-    let footer_start = rows.saturating_sub(footer_lines as u16).max(3);
-    let image_rows = footer_start.saturating_sub(2).max(5);
-    let rendered = if state.show_tree_page || state.show_help_page || state.listing_page.is_some() {
-        Vec::new()
+    if event::poll(Duration::from_millis(80))? {
+        Ok(input_from_event(event::read()?))
     } else {
-        rendered_page_output(state, fmt, cols, image_rows)?
-    };
-
-    begin_sync_update()?;
-    clear_terminal_images(fmt)?;
-    execute!(io::stdout(), MoveTo(0, 0), Clear(ClearType::All))?;
-    let title = state
-        .original
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .and_then(OsStr::to_str)
-        .unwrap_or("new document");
-    print_header(state, title, dirty, cols)?;
-    if let Some(preview) = state.crop_preview {
-        print_crop_controls(state, preview, footer_start, cols)?;
-        print_history(state, footer_start + 2, cols, rows)?;
-    } else {
-        let default_status = if state.listing_page.is_some() {
-            "List: Up/Down move, Space mark, Enter add/open, Esc close | :add FILE still works"
-        } else if state.show_tree_page {
-            "Tree: Up/Down move, Enter restore, Esc close | :goto N still works"
-        } else {
-            "Move: n/p, g/G, o go to | Select: m toggle/unselect, :select, :unselect, :clear"
-        };
-        let status = take_message(state, default_status);
-        print_status_line(footer_start, &status, cols)?;
-        print_legend_line(
-            footer_start + 1,
-            cols,
-            &[
-                (
-                    "Edit",
-                    "r/R rotate, M mirror, d delete, :move, c crop, :compress",
-                    Color::Yellow,
-                ),
-                ("Order", "</> move pages", Color::Blue),
-                ("Add", "S scan, :add", Color::Green),
-            ],
-        )?;
-        print_legend_line(
-            footer_start + 2,
-            cols,
-            &[
-                ("Undo", "u/^Z, U redo, :tree/:history, :goto N", Color::Cyan),
-                ("Help", ":help", Color::Green),
-                ("File", "s save, q/x quit", Color::Magenta),
-            ],
-        )?;
-        print_history(state, footer_start + 3, cols, rows)?;
+        Ok(Input::Unknown)
     }
-    execute!(io::stdout(), MoveTo(0, 1))?;
-    if state.show_tree_page {
-        print_tree_page(state, cols, image_rows)?;
-    } else if state.show_help_page {
-        print_help_page(cols, image_rows)?;
-    } else if let Some(listing) = &state.listing_page {
-        print_listing_page(listing, cols, image_rows)?;
-    } else {
-        io::stdout().write_all(&rendered)?;
-    }
-    end_sync_update()?;
-    Ok(())
-}
-
-fn print_footer(state: &mut State, cols: u16, rows: u16, default: &str) -> Result<()> {
-    let status = take_message(state, default);
-    print_status_line(rows.saturating_sub(2), &status, cols)?;
-    print_history(state, rows.saturating_sub(1), cols, rows)?;
-    io::stdout().flush()?;
-    Ok(())
-}
-
-fn print_status_line(row: u16, text: &str, cols: u16) -> Result<()> {
-    execute!(io::stdout(), MoveTo(0, row))?;
-    if let Some((message, rest)) = text.split_once(" || ") {
-        print_colored_segment("Status", Color::Green, cols)?;
-        print_colored_segment(": ", Color::DarkGrey, cols)?;
-        print_colored_segment(message, Color::Yellow, cols)?;
-        print_colored_segment(" | ", Color::DarkGrey, cols)?;
-        print_colored_segment(rest, Color::White, cols)?;
-    } else if let Some(rest) = text.strip_prefix("Move: ") {
-        print_colored_segment("Move", Color::Blue, cols)?;
-        print_colored_segment(": ", Color::DarkGrey, cols)?;
-        print_colored_segment(rest, Color::White, cols)?;
-    } else {
-        print_colored_segment("Status", Color::Green, cols)?;
-        print_colored_segment(": ", Color::DarkGrey, cols)?;
-        print_colored_segment(text, Color::White, cols)?;
-    }
-    execute!(io::stdout(), ResetColor)?;
-    clear_to_end_of_line(cols)?;
-    Ok(())
-}
-
-fn print_legend_line(row: u16, cols: u16, groups: &[(&str, &str, Color)]) -> Result<()> {
-    execute!(io::stdout(), MoveTo(0, row))?;
-    for (idx, (label, body, color)) in groups.iter().enumerate() {
-        if idx > 0 {
-            print_colored_segment(" | ", Color::DarkGrey, cols)?;
-        }
-        print_colored_segment(label, *color, cols)?;
-        print_colored_segment(": ", Color::DarkGrey, cols)?;
-        print_colored_segment(body, Color::White, cols)?;
-    }
-    execute!(io::stdout(), ResetColor)?;
-    clear_to_end_of_line(cols)?;
-    Ok(())
-}
-
-fn print_crop_controls(state: &mut State, preview: CropPreview, row: u16, cols: u16) -> Result<()> {
-    let names = ["left", "top", "right", "bottom"];
-    let status = take_message(state, "Crop: arrows/hjkl +5, HJKL +50, -5, _ -50, Tab edge");
-    print_status_line(row, &status, cols)?;
-    execute!(io::stdout(), MoveTo(0, row + 1))?;
-    print_colored_segment("Crop", Color::Yellow, cols)?;
-    print_colored_segment(": ", Color::DarkGrey, cols)?;
-    for (idx, name) in names.iter().enumerate() {
-        if idx > 0 {
-            print_colored_segment(" | ", Color::DarkGrey, cols)?;
-        }
-        let color = if idx == preview.active_edge {
-            Color::Red
-        } else {
-            Color::White
-        };
-        print_colored_segment(&format!("{name} {}", preview.margins[idx]), color, cols)?;
-    }
-    execute!(io::stdout(), ResetColor)?;
-    clear_to_end_of_line(cols)?;
-    Ok(())
-}
-
-fn print_header(state: &State, title: &str, dirty: &str, cols: u16) -> Result<()> {
-    let selected_here = state.selected.contains(&state.page);
-    let page_label = if selected_here {
-        format!("page {}/{} SELECTED", state.page + 1, state.page_count)
-    } else {
-        format!("page {}/{}", state.page + 1, state.page_count)
-    };
-    let selection = if state.selected.is_empty() {
-        "selected 0".to_string()
-    } else {
-        format!(
-            "selected {} [{}]",
-            state.selected.len(),
-            page_ranges_label(state.selected.iter().copied())
-        )
-    };
-    execute!(io::stdout(), MoveTo(0, 0), SetForegroundColor(Color::White))?;
-    print_colored_segment(title, Color::White, cols)?;
-    print_colored_segment(" | ", Color::DarkGrey, cols)?;
-    print_colored_segment(
-        &page_label,
-        if selected_here {
-            Color::Yellow
-        } else {
-            Color::White
-        },
-        cols,
-    )?;
-    print_colored_segment(" | ", Color::DarkGrey, cols)?;
-    print_colored_segment(
-        &selection,
-        if state.selected.is_empty() {
-            Color::DarkGrey
-        } else {
-            Color::Yellow
-        },
-        cols,
-    )?;
-    print_colored_segment(" | ", Color::DarkGrey, cols)?;
-    print_colored_segment(
-        dirty,
-        if state.dirty {
-            Color::Red
-        } else {
-            Color::DarkGrey
-        },
-        cols,
-    )?;
-    print_colored_segment(" | save -> ", Color::DarkGrey, cols)?;
-    print_colored_segment(&state.out.display().to_string(), Color::White, cols)?;
-    execute!(io::stdout(), ResetColor)?;
-    clear_to_end_of_line(cols)?;
-    Ok(())
-}
-
-fn print_colored_segment(text: &str, color: Color, cols: u16) -> Result<()> {
-    let (x, _) = crossterm::cursor::position().unwrap_or((cols, 0));
-    if x >= cols {
-        return Ok(());
-    }
-    execute!(io::stdout(), SetForegroundColor(color))?;
-    print!("{}", truncate(text, cols - x));
-    Ok(())
-}
-
-fn clear_to_end_of_line(cols: u16) -> Result<()> {
-    let (x, _) = crossterm::cursor::position().unwrap_or((cols, 0));
-    if x < cols {
-        print!("{}", " ".repeat((cols - x) as usize));
-    }
-    Ok(())
-}
-
-fn print_history(state: &State, mut row: u16, cols: u16, rows: u16) -> Result<()> {
-    if !state.history.is_empty() {
-        print_recent_line(row, cols, &state.history)?;
-        row += 1;
-    }
-    while row < rows {
-        print_at(row, &" ".repeat(cols as usize))?;
-        row += 1;
-    }
-    Ok(())
-}
-
-fn print_recent_line(row: u16, cols: u16, history: &[String]) -> Result<()> {
-    execute!(io::stdout(), MoveTo(0, row))?;
-    print_colored_segment("Recent", Color::DarkGrey, cols)?;
-    print_colored_segment(": ", Color::DarkGrey, cols)?;
-    for (idx, item) in history.iter().enumerate() {
-        if idx > 0 {
-            print_colored_segment(" | ", Color::DarkGrey, cols)?;
-        }
-        print_colored_segment(&history_label(item), history_color(item), cols)?;
-    }
-    execute!(io::stdout(), ResetColor)?;
-    clear_to_end_of_line(cols)?;
-    Ok(())
-}
-
-fn history_label(item: &str) -> String {
-    let max = 48;
-    if item.chars().count() <= max {
-        item.to_string()
-    } else {
-        format!(
-            "{}...",
-            item.chars().take(max.saturating_sub(3)).collect::<String>()
-        )
-    }
-}
-
-fn print_tree_page(state: &State, cols: u16, rows: u16) -> Result<()> {
-    let lines = tree_lines(state);
-    for row in 0..rows {
-        execute!(io::stdout(), MoveTo(0, row + 1))?;
-        if let Some((id, line)) = lines.get(row as usize) {
-            let selected = row as usize == state.tree_cursor;
-            let marker = if selected { "> " } else { "  " };
-            let color = if selected {
-                Color::Yellow
-            } else if *id == state.current_snapshot {
-                Color::Yellow
-            } else if *id == state.saved_snapshot {
-                Color::Green
-            } else {
-                Color::White
-            };
-            print_colored_segment(&format!("{marker}{line}"), color, cols)?;
-            execute!(io::stdout(), ResetColor)?;
-            clear_to_end_of_line(cols)?;
-        } else {
-            print!("{}", " ".repeat(cols as usize));
-        }
-    }
-    Ok(())
 }
 
 fn tree_lines(state: &State) -> Vec<(usize, String)> {
@@ -1170,191 +976,6 @@ fn activate_tree_selection(state: &mut State) -> Result<()> {
         .unwrap_or(0);
     state.message = format!("history: moved to {id}");
     state.add_history(state.message.clone());
-    Ok(())
-}
-
-fn print_help_page(cols: u16, rows: u16) -> Result<()> {
-    let lines = [
-        ("pdfview help", Color::Yellow),
-        ("", Color::White),
-        ("Keys", Color::Cyan),
-        ("  n / Right / Space     next page", Color::White),
-        ("  p / Left              previous page", Color::White),
-        ("  mouse wheel           next / previous page", Color::White),
-        ("  g / G                 first / last page", Color::White),
-        ("  o                     go to page prompt", Color::White),
-        (
-            "  m                     toggle current page selection",
-            Color::White,
-        ),
-        ("  r / R                 rotate right / left", Color::White),
-        (
-            "  M                     mirror selected/current page",
-            Color::White,
-        ),
-        (
-            "  d                     delete selected/current page",
-            Color::White,
-        ),
-        (
-            "  < / >                 move selected/current pages backward / forward",
-            Color::White,
-        ),
-        (
-            "  c                     crop selected/current pages",
-            Color::White,
-        ),
-        (
-            "  S                     scan with default DPI",
-            Color::White,
-        ),
-        ("  u / Ctrl-Z / U        undo / redo", Color::White),
-        (
-            "  s                     save to current output path",
-            Color::White,
-        ),
-        (
-            "  q / x / Esc / Ctrl-C  quit, Esc closes help/tree/crop first",
-            Color::White,
-        ),
-        ("", Color::White),
-        ("Commands", Color::Cyan),
-        (
-            "  :save, :w             save to current output path",
-            Color::White,
-        ),
-        (
-            "  :save NAME            save as NAME.pdf in current output dir",
-            Color::White,
-        ),
-        ("  :save NAME DIR        save as DIR/NAME.pdf", Color::White),
-        (
-            "  :save PATH            save to PATH; .pdf is added if omitted",
-            Color::White,
-        ),
-        (
-            "  :rename NAME [DIR]    rename/move current output file or target",
-            Color::White,
-        ),
-        (
-            "  :save-as PATH         legacy alias for :save PATH",
-            Color::White,
-        ),
-        (
-            "                        saved PDFs are written as PDF 1.7+",
-            Color::DarkGrey,
-        ),
-        (
-            "  :add [FILE...|DIR]    add files, or open picker when empty/dir",
-            Color::White,
-        ),
-        (
-            "  :ls [DIR]             open add picker; Space marks many",
-            Color::White,
-        ),
-        ("  :page N               go to page N", Color::White),
-        ("  :select 1,3-5         select page set", Color::White),
-        ("  :select all           select every page", Color::White),
-        (
-            "  :unselect 4-7         remove pages from selection",
-            Color::White,
-        ),
-        ("  :unselect all, :clear clear selection", Color::White),
-        (
-            "  :rotate, :right       rotate selected/current pages right",
-            Color::White,
-        ),
-        (
-            "  :rotate-left, :left   rotate selected/current pages left",
-            Color::White,
-        ),
-        (
-            "  :mirror, :flip        mirror selected/current pages",
-            Color::White,
-        ),
-        (
-            "  :delete, :del         delete selected/current pages",
-            Color::White,
-        ),
-        (
-            "  :crop                 crop selected/current pages",
-            Color::White,
-        ),
-        (
-            "  :compress LEVEL       LEVEL: light, normal, strong",
-            Color::White,
-        ),
-        (
-            "  :move N               move selection before page N",
-            Color::White,
-        ),
-        (
-            "  :back/<, :forward/>   move selection one page backward / forward",
-            Color::White,
-        ),
-        (
-            "  :scan [DPI]           scan one or more pages",
-            Color::White,
-        ),
-        (
-            "  :tree, :history       show full history tree",
-            Color::White,
-        ),
-        (
-            "  :goto N               jump to history node N",
-            Color::White,
-        ),
-        ("  :undo, :redo          undo / redo", Color::White),
-        ("  :q, :quit, :exit      quit", Color::White),
-        (
-            "  :help                 toggle this help page",
-            Color::White,
-        ),
-    ];
-    for row in 0..rows {
-        execute!(io::stdout(), MoveTo(0, row + 1))?;
-        if let Some((line, color)) = lines.get(row as usize) {
-            print_colored_segment(line, *color, cols)?;
-            execute!(io::stdout(), ResetColor)?;
-            clear_to_end_of_line(cols)?;
-        } else {
-            print!("{}", " ".repeat(cols as usize));
-        }
-    }
-    Ok(())
-}
-
-fn print_listing_page(listing: &ListingPage, cols: u16, rows: u16) -> Result<()> {
-    for row in 0..rows {
-        execute!(io::stdout(), MoveTo(0, row + 1))?;
-        if row == 0 {
-            print_colored_segment(&listing.title, Color::Yellow, cols)?;
-        } else if let Some(entry) = listing.entries.get(row.saturating_sub(1) as usize) {
-            let idx = row.saturating_sub(1) as usize;
-            let selected = idx == listing.selected && entry.kind != ListingEntryKind::Empty;
-            let marked = listing.marked.contains(&idx);
-            let color = if selected {
-                Color::Yellow
-            } else if marked {
-                Color::Green
-            } else if entry.kind == ListingEntryKind::Directory {
-                Color::Cyan
-            } else {
-                Color::White
-            };
-            let marker = match (selected, marked) {
-                (true, true) => ">*",
-                (true, false) => "> ",
-                (false, true) => " *",
-                (false, false) => "  ",
-            };
-            print_colored_segment(&format!("{marker}{}", entry.label), color, cols)?;
-        } else {
-            print!("{}", " ".repeat(cols as usize));
-        }
-        execute!(io::stdout(), ResetColor)?;
-        clear_to_end_of_line(cols)?;
-    }
     Ok(())
 }
 
@@ -1401,57 +1022,6 @@ fn build_tree_lines(
     }
 }
 
-fn history_color(item: &str) -> Color {
-    if item.starts_with("delete") {
-        Color::Red
-    } else if item.starts_with("rotate") {
-        Color::Yellow
-    } else if item.starts_with("mirror") || item.starts_with("crop") {
-        Color::Magenta
-    } else if item.starts_with("move") {
-        Color::Blue
-    } else if item.starts_with("selected") {
-        Color::Green
-    } else if item.starts_with("unselected") {
-        Color::DarkYellow
-    } else if item.starts_with("save") {
-        Color::Cyan
-    } else if item.starts_with("undo") || item.starts_with("redo") {
-        Color::Blue
-    } else {
-        Color::White
-    }
-}
-
-fn take_message(state: &mut State, default: &str) -> String {
-    if state.message.is_empty() {
-        default.into()
-    } else {
-        let msg = state.message.clone();
-        state.message.clear();
-        msg
-    }
-}
-
-fn print_at(row: u16, text: &str) -> Result<()> {
-    execute!(io::stdout(), MoveTo(0, row))?;
-    print!("{text}");
-    Ok(())
-}
-
-fn truncate(text: &str, cols: u16) -> String {
-    text.chars().take(cols as usize).collect()
-}
-
-fn pad_to_cols(text: &str, cols: u16) -> String {
-    let mut out = truncate(text, cols);
-    let len = out.chars().count();
-    if len < cols as usize {
-        out.push_str(&" ".repeat(cols as usize - len));
-    }
-    out
-}
-
 fn begin_sync_update() -> Result<()> {
     io::stdout().write_all(b"\x1b[?2026h")?;
     Ok(())
@@ -1489,14 +1059,31 @@ fn rendered_page_output(state: &mut State, fmt: &str, cols: u16, rows: u16) -> R
         rows,
         format: fmt.to_string(),
     };
+    let changed = state.last_rendered_key.as_ref() != Some(&key);
+    if changed {
+        if let Ok(mut cache) = state.render_cache.lock() {
+            cache.retain(|cached, _| {
+                cached.snapshot == key.snapshot
+                    && cached.cols == cols
+                    && cached.rows == rows
+                    && cached.page.abs_diff(state.page) <= 4
+            });
+        }
+    }
     if let Some(output) = state
         .render_cache
         .lock()
         .ok()
         .and_then(|cache| cache.get(&key).cloned())
     {
+        if state.message.starts_with("rendering page ") {
+            state.message.clear();
+        }
         state.last_rendered = Some(output.clone());
         state.last_rendered_key = Some(key);
+        if changed {
+            prefetch_pages(state, cols, rows, fmt);
+        }
         return Ok(output);
     }
 
@@ -1528,74 +1115,8 @@ fn rendered_page_output(state: &mut State, fmt: &str, cols: u16, rows: u16) -> R
     Ok(output)
 }
 
-fn prompt(label: &str) -> Result<String> {
-    let (cols, rows) = terminal::size().unwrap_or((100, 40));
-    let row = rows.saturating_sub(1);
-    let mut line = String::new();
-    execute!(
-        io::stdout(),
-        Show,
-        MoveTo(0, row),
-        Clear(ClearType::CurrentLine),
-        SetForegroundColor(Color::Yellow)
-    )?;
-    loop {
-        execute!(
-            io::stdout(),
-            MoveTo(0, row),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(Color::Yellow)
-        )?;
-        print!("{}", truncate(label, cols));
-        execute!(io::stdout(), ResetColor)?;
-        let used = label.chars().count().min(cols as usize) as u16;
-        if used < cols {
-            print!("{}", truncate(&line, cols - used));
-        }
-        io::stdout().flush()?;
-        match event::read()? {
-            Event::Key(KeyEvent {
-                code: KeyCode::Enter,
-                ..
-            }) => break,
-            Event::Key(KeyEvent {
-                code: KeyCode::Esc, ..
-            }) => {
-                line.clear();
-                break;
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::Backspace,
-                ..
-            }) => {
-                line.pop();
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            }) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
-                line.push(c);
-            }
-            _ => {}
-        }
-    }
-    execute!(
-        io::stdout(),
-        Hide,
-        MoveTo(0, row),
-        Clear(ClearType::CurrentLine)
-    )?;
-    Ok(line.trim().to_string())
-}
-
-fn confirm(label: &str) -> Result<bool> {
-    Ok(prompt(label)?.eq_ignore_ascii_case("y"))
-}
-
-fn go_to_page_prompt(state: &mut State) -> Result<()> {
-    let raw = prompt("Go to page: ")?;
-    go_to_page(state, &raw)
+fn confirm(state: &mut State, label: &str) -> Result<bool> {
+    ui::confirm(state, label)
 }
 
 fn go_to_page(state: &mut State, raw: &str) -> Result<()> {
@@ -1608,12 +1129,85 @@ fn go_to_page(state: &mut State, raw: &str) -> Result<()> {
     Ok(())
 }
 
-fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
+fn prompt_command(state: &mut State, _fmt: &str) -> Result<UiAction> {
+    state.command = Some(actions::LineInput::default());
+    state.command_history_cursor = None;
+    Ok(UiAction::Redraw)
+}
+
+fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<UiAction> {
     let parts = shell_words::split(line.trim()).context("parse command")?;
     if parts.is_empty() {
-        return Ok(());
+        return Ok(UiAction::Noop);
     }
-    match parts[0].trim_start_matches(':') {
+    let name = parts[0].trim_start_matches(':');
+    if name.chars().all(|c| c.is_ascii_digit()) && !name.is_empty() {
+        go_to_page(state, name)?;
+        return Ok(UiAction::Redraw);
+    }
+    match name {
+        "next" | "prev" | "first" | "last" => {
+            state.show_tree_page = false;
+            state.listing_page = None;
+            state.page = match name {
+                "next" => (state.page + 1).min(state.page_count.saturating_sub(1)),
+                "prev" => state.page.saturating_sub(1),
+                "first" => 0,
+                _ => state.page_count.saturating_sub(1),
+            };
+            Ok(())
+        }
+        "mark" => {
+            if state.page_count == 0 {
+                bail!("no pages to mark");
+            }
+            if !state.selected.insert(state.page) {
+                state.selected.remove(&state.page);
+            }
+            Ok(())
+        }
+        "print" | "print!" => {
+            if state.page_count == 0 {
+                bail!("no pages to print");
+            }
+            let options = printing::options_from_args(
+                &state.config.printing,
+                &parts[1..],
+                !state.selected.is_empty(),
+            )?;
+            if name == "print!" {
+                let needs_caps = options.color != printing::ColorMode::Auto
+                    || options.quality != printing::Quality::Auto
+                    || options.paper_type != printing::PaperType::Auto
+                    || options.paper.is_some()
+                    || matches!(
+                        options.sides,
+                        printing::Sides::LongEdge | printing::Sides::ShortEdge
+                    );
+                let caps = if needs_caps {
+                    printing::printer_info(options.printer.as_deref()).1
+                } else {
+                    printing::Capabilities::default()
+                };
+                print_document(state, &options, &caps)?;
+            } else {
+                state.print_dialog =
+                    Some(printing::Dialog::open(options, !state.selected.is_empty()));
+            }
+            Ok(())
+        }
+        "reload" => {
+            state.config = config::Config::load()?;
+            if let Some(ui) = &mut state.ui {
+                ui.invalidate();
+            }
+            state.message = "Theme and print defaults reloaded".into();
+            Ok(())
+        }
+        "config" => {
+            state.message = config::path().display().to_string();
+            Ok(())
+        }
         "page" if parts.len() == 2 => go_to_page(state, &parts[1]),
         "select" if parts.len() == 2 => {
             state.selected = if parts[1] == "all" {
@@ -1649,7 +1243,18 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
         "save-as" | "write" => save_as_command(state, &parts[1..]),
         "rename" | "ren" => rename_command(state, &parts[1..]),
         "q" | "quit" | "exit" | "close" => {
-            std::process::exit(0);
+            if state.dirty {
+                bail!("Unsaved changes · :wq saves and quits · :q! discards edits");
+            }
+            return Ok(UiAction::Quit);
+        }
+        "q!" | "quit!" => return Ok(UiAction::Quit),
+        "wq" | "x" => {
+            save(state, None)?;
+            if state.dirty {
+                bail!("Save cancelled; document remains open");
+            }
+            return Ok(UiAction::Quit);
         }
         "undo" => undo(state),
         "redo" => redo(state),
@@ -1679,7 +1284,7 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
         "la" | "ls" => list_addable_files(state, parts.get(1).map(String::as_str)),
         "history" | "tree" => {
             state.show_tree_page = !state.show_tree_page;
-            state.show_help_page = false;
+            state.help = None;
             state.listing_page = None;
             state.tree_cursor = tree_lines(state)
                 .iter()
@@ -1693,14 +1298,7 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
             Ok(())
         }
         "help" | "h" | "?" => {
-            state.show_help_page = !state.show_help_page;
-            state.show_tree_page = false;
-            state.listing_page = None;
-            state.message = if state.show_help_page {
-                "help page shown".into()
-            } else {
-                "help page hidden".into()
-            };
+            state.help = Some(actions::Help::default());
             Ok(())
         }
         "goto" if parts.len() == 2 => {
@@ -1718,7 +1316,8 @@ fn command_line(state: &mut State, fmt: &str, line: &str) -> Result<()> {
             state.message = format!("unknown command: {line}");
             Ok(())
         }
-    }
+    }?;
+    Ok(UiAction::Redraw)
 }
 
 fn rotate(state: &mut State, degrees: i32, use_selection: bool) -> Result<()> {
@@ -1769,7 +1368,7 @@ fn delete_pages(state: &mut State, use_selection: bool) -> Result<()> {
 fn move_pages(state: &mut State, target_page_1: usize) -> Result<()> {
     let total = state.page_count;
     let targets = state.targets(true)?;
-    if target_page_1 > total {
+    if !(1..=total).contains(&target_page_1) {
         bail!("target page out of range");
     }
     let target = target_page_1.saturating_sub(1);
@@ -1778,7 +1377,10 @@ fn move_pages(state: &mut State, target_page_1: usize) -> Result<()> {
     }
     let target_set: BTreeSet<usize> = targets.iter().copied().collect();
     let remaining: Vec<usize> = (0..total).filter(|p| !target_set.contains(p)).collect();
-    let insert_at = target.min(remaining.len());
+    let insert_at = remaining
+        .iter()
+        .position(|&page| page == target)
+        .ok_or_else(|| anyhow!("target page not found"))?;
     let mut order = Vec::new();
     order.extend_from_slice(&remaining[..insert_at]);
     order.extend_from_slice(&targets);
@@ -1876,6 +1478,7 @@ fn crop_pages(state: &mut State, fmt: &str, use_selection: bool) -> Result<()> {
     let mut margins = [0_u32; 4];
     let mut edge = 0_usize;
     let names = ["left", "top", "right", "bottom"];
+    let mut pending_input = None;
     loop {
         state.crop_preview = Some(CropPreview {
             margins,
@@ -1885,8 +1488,12 @@ fn crop_pages(state: &mut State, fmt: &str, use_selection: bool) -> Result<()> {
             "crop {} LTRB={},{},{},{} | arrows/hjkl +5, HJKL +50, -5, _ -50, Tab edge",
             names[edge], margins[0], margins[1], margins[2], margins[3]
         );
-        show(state, fmt)?;
-        match read_input()? {
+        ui::show(state, fmt)?;
+        let input = match pending_input.take() {
+            Some(input) => input,
+            None => actions::normal_input(read_input()?),
+        };
+        match input {
             Input::Esc | Input::Char('q') => {
                 state.crop_preview = None;
                 state.message = "crop cancelled".into();
@@ -1924,31 +1531,31 @@ fn crop_pages(state: &mut State, fmt: &str, use_selection: bool) -> Result<()> {
             Input::Left => {
                 edge = 0;
                 margins[edge] += 5;
-                drain_pending_crop_adjust_inputs()?;
+                pending_input = drain_pending_crop_adjust_inputs()?;
             }
             Input::Right => {
                 edge = 2;
                 margins[edge] += 5;
-                drain_pending_crop_adjust_inputs()?;
+                pending_input = drain_pending_crop_adjust_inputs()?;
             }
             Input::Up => {
                 edge = 1;
                 margins[edge] += 5;
-                drain_pending_crop_adjust_inputs()?;
+                pending_input = drain_pending_crop_adjust_inputs()?;
             }
             Input::Down => {
                 edge = 3;
                 margins[edge] += 5;
-                drain_pending_crop_adjust_inputs()?;
+                pending_input = drain_pending_crop_adjust_inputs()?;
             }
             Input::Tab | Input::Char('\t') => edge = (edge + 1) % 4,
             Input::Char('-') => {
                 margins[edge] = margins[edge].saturating_sub(5);
-                drain_pending_crop_adjust_inputs()?;
+                pending_input = drain_pending_crop_adjust_inputs()?;
             }
             Input::Char('_') => {
                 margins[edge] = margins[edge].saturating_sub(50);
-                drain_pending_crop_adjust_inputs()?;
+                pending_input = drain_pending_crop_adjust_inputs()?;
             }
             Input::Char(c) if matches!(c, 'h' | 'j' | 'k' | 'l' | 'H' | 'J' | 'K' | 'L') => {
                 let amount = if c.is_uppercase() { 50 } else { 5 };
@@ -1960,7 +1567,7 @@ fn crop_pages(state: &mut State, fmt: &str, use_selection: bool) -> Result<()> {
                     _ => edge,
                 };
                 margins[edge] += amount;
-                drain_pending_crop_adjust_inputs()?;
+                pending_input = drain_pending_crop_adjust_inputs()?;
             }
             _ => {}
         }
@@ -1980,18 +1587,19 @@ fn crop_pages(state: &mut State, fmt: &str, use_selection: bool) -> Result<()> {
     Ok(())
 }
 
-fn drain_pending_crop_adjust_inputs() -> Result<()> {
+fn drain_pending_crop_adjust_inputs() -> Result<Option<Input>> {
     while event::poll(Duration::from_millis(0))? {
-        match read_input()? {
+        match actions::normal_input(read_input()?) {
             Input::Left
             | Input::Right
             | Input::Up
             | Input::Down
             | Input::Char('h' | 'j' | 'k' | 'l' | 'H' | 'J' | 'K' | 'L' | '-' | '_') => {}
-            _ => break,
+            Input::Unknown => {}
+            input => return Ok(Some(input)),
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn compress_pages(state: &mut State, level: &str, use_selection: bool) -> Result<()> {
@@ -2070,78 +1678,106 @@ fn file_size(path: &Path) -> Result<u64> {
 }
 
 fn scan_pages(state: &mut State, dpi: Option<u32>) -> Result<()> {
-    let mut added = 0;
-    loop {
-        let tmp = state.temp.path().join(format!("scan-{added}.pdf"));
-        enter_scan_screen()?;
-        let scan_result = run_scan_command(&tmp, dpi);
-        leave_scan_screen()?;
-        scan_result?;
-        if !tmp.exists() || fs::metadata(&tmp)?.len() == 0 {
-            bail!("scan command finished but did not create a PDF");
-        }
-        append_pdf_file(state, &tmp, false)?;
-        added += 1;
-        if !confirm("Scan another page? [y/N] ")? {
-            break;
-        }
+    let mut options = state.config.scanning.clone();
+    if let Some(dpi) = dpi {
+        options.dpi = dpi;
     }
-    if added > 0 {
-        state.record_snapshot(format!("scan: {added} page{}", plural(added)))?;
-        state.message = format!(
-            "scanned {added} page{}; showing page {}",
-            plural(added),
-            state.page + 1
-        );
-    }
+    let cached = state
+        .scan_device
+        .as_ref()
+        .and_then(scanning::CachedDevice::device);
+    state.scan = Some(scanning::Session::start_cached(
+        options,
+        state.temp.path(),
+        cached,
+    )?);
+    state.show_tree_page = false;
+    state.listing_page = None;
+    state.help = None;
     Ok(())
 }
 
-fn run_scan_command(out: &Path, dpi: Option<u32>) -> Result<()> {
-    sudo_preflight()?;
-    let command = std::env::var("PDFVIEW_SCAN_COMMAND").unwrap_or_else(|_| {
-        "source ~/coding/hpscan/hpscan.zsh && hpscan \"$1\" \"$2\"".to_string()
-    });
-    let mut child = Command::new("zsh")
-        .arg("-lc")
-        .arg(command)
-        .arg("pdfview-scan")
-        .arg(out)
-        .arg(dpi.map(|dpi| dpi.to_string()).unwrap_or_default())
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("start scan command")?;
-    let status = child.wait().context("wait for scan command")?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!(
-            "scan command failed with {status}; if sudo rejected the password, stop scanning and test `sudo -v` in a normal terminal"
-        );
+fn handle_scan_input(state: &mut State, input: Input) -> Result<UiAction> {
+    let mut session = state.scan.take().expect("scan session exists");
+    let mut changed = false;
+    if let Some(job) = &session.job {
+        let (progress, outcome) = job.poll();
+        changed = session.progress != progress;
+        session.progress = progress;
+        if let Some(outcome) = outcome {
+            match outcome {
+                scanning::Outcome::Done => {
+                    let result = append_pdf_file(state, &job.output, false)
+                        .and_then(|_| state.record_snapshot("scan page"));
+                    match result {
+                        Ok(()) => {
+                            if let Some(device) = &session.progress.device {
+                                state.scan_device =
+                                    Some(scanning::CachedDevice::remember(device.clone()));
+                            }
+                            session.pages_added += 1;
+                            session.ready = true;
+                            state.message = format!(
+                                "Scanned {} page{} · showing page {}",
+                                session.pages_added,
+                                plural(session.pages_added),
+                                state.page + 1
+                            );
+                        }
+                        Err(error) => session.error = Some(format!("{error:#}")),
+                    }
+                }
+                scanning::Outcome::Cancelled => {
+                    state.message = "Scan cancelled · completed pages kept".into();
+                    return Ok(UiAction::Redraw);
+                }
+                scanning::Outcome::Failed(error) => {
+                    state.scan_device = None;
+                    session.error = Some(error);
+                }
+            }
+            session.job = None;
+            changed = true;
+        }
     }
-}
-
-fn sudo_preflight() -> Result<()> {
-    println!("Checking sudo authentication before scanner command...");
-    io::stdout().flush()?;
-    let status = Command::new("sudo")
-        .arg("-v")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("run sudo -v before scan")?;
-    if status.success() {
-        println!("Sudo authentication ok.");
-        io::stdout().flush()?;
-        Ok(())
-    } else {
-        bail!(
-            "sudo authentication failed before scan; wait for faillock unlock if needed, then test `sudo -v` in a normal terminal"
-        )
+    match actions::normal_input(input) {
+        Input::Esc | Input::CtrlC => {
+            if let Some(job) = &session.job {
+                job.cancel();
+                session.cancelling = true;
+                changed = true;
+            } else {
+                return Ok(UiAction::Redraw);
+            }
+        }
+        Input::Enter | Input::Char('r' | 'S') if session.job.is_none() => {
+            let cached = if session.error.is_none() {
+                state
+                    .scan_device
+                    .as_ref()
+                    .and_then(scanning::CachedDevice::device)
+            } else {
+                None
+            };
+            let pages_added = session.pages_added;
+            session = scanning::Session::start_cached(session.options, state.temp.path(), cached)?;
+            session.pages_added = pages_added;
+            changed = true;
+        }
+        Input::Resize => {
+            if let Some(ui) = &mut state.ui {
+                ui.invalidate();
+            }
+            changed = true;
+        }
+        _ => {}
     }
+    state.scan = Some(session);
+    Ok(if changed {
+        UiAction::Redraw
+    } else {
+        UiAction::Noop
+    })
 }
 
 fn add_command(state: &mut State, paths: &[String]) -> Result<()> {
@@ -2232,7 +1868,7 @@ fn list_addable_files(state: &mut State, raw_dir: Option<&str>) -> Result<()> {
         });
     }
     state.show_tree_page = false;
-    state.show_help_page = false;
+    state.help = None;
     state.listing_page = Some(ListingPage {
         title: format!("Addable files in {} | Enter add/open", dir.display()),
         entries,
@@ -2394,10 +2030,13 @@ fn rename_output(state: &mut State, out: PathBuf) -> Result<()> {
     }
     if state.out.exists() {
         if out.exists()
-            && !confirm(&format!(
-                "Rename to {}? File exists; overwrite? [y/N] ",
-                out.display()
-            ))?
+            && !confirm(
+                state,
+                &format!(
+                    "Rename to {}? File exists; overwrite? [y/N] ",
+                    out.display()
+                ),
+            )?
         {
             state.message = format!("rename cancelled: {}", out.display());
             return Ok(());
@@ -2465,13 +2104,13 @@ fn pdf_output_path(path: PathBuf) -> Result<PathBuf> {
 }
 
 fn save_to_path(state: &mut State, out: PathBuf) -> Result<bool> {
-    let current = state.current_pdf()?;
+    let current = state.current_pdf()?.to_path_buf();
     if out.exists()
         && Some(&out) != state.original.as_ref()
-        && !confirm(&format!(
-            "Save to {}? File exists; overwrite? [y/N] ",
-            out.display()
-        ))?
+        && !confirm(
+            state,
+            &format!("Save to {}? File exists; overwrite? [y/N] ", out.display()),
+        )?
     {
         state.message = format!("save cancelled: {}", out.display());
         return Ok(false);
@@ -2486,7 +2125,7 @@ fn save_to_path(state: &mut State, out: PathBuf) -> Result<bool> {
         ))
         .suffix(".pdf")
         .tempfile_in(out.parent().unwrap_or_else(|| Path::new(".")))?;
-    write_saved_pdf(current, tmp.path())?;
+    write_saved_pdf(&current, tmp.path())?;
     qpdf_check(tmp.path())?;
     tmp.persist(&out).map_err(|e| anyhow!(e.error))?;
     state.saved_snapshot = state.current_snapshot;
@@ -2529,7 +2168,6 @@ fn prefetch_pages(state: &State, cols: u16, rows: u16, fmt: &str) {
                 pages.push(page as usize);
             }
         }
-        pages.extend((current + 3)..total);
         for page in pages {
             let key = RenderKey {
                 snapshot,
@@ -2624,18 +2262,30 @@ fn render_page_output_with_crop_preview(
 }
 
 fn render_pixel_limits(cols: u16, rows: u16) -> (usize, usize) {
+    let (cell_width, cell_height) = cell_pixel_size();
     (
-        (cols as usize).saturating_mul(10).clamp(240, 2400),
-        (rows as usize).saturating_mul(20).clamp(240, 3200),
+        (cols as usize).saturating_mul(cell_width).clamp(1, 2400),
+        (rows as usize).saturating_mul(cell_height).clamp(1, 3200),
     )
 }
 
-fn crop_preview_pixel_limits(state: &State) -> (usize, usize) {
+fn cell_pixel_size() -> (usize, usize) {
+    terminal::window_size()
+        .ok()
+        .filter(|size| size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0)
+        .map(|size| {
+            (
+                (size.width / size.columns).max(1) as usize,
+                (size.height / size.rows).max(1) as usize,
+            )
+        })
+        .unwrap_or((10, 20))
+}
+
+fn crop_preview_pixel_limits(_state: &State) -> (usize, usize) {
     let (cols, rows) = terminal::size().unwrap_or((100, 40));
-    let footer_lines = 3 + usize::from(!state.history.is_empty());
-    let footer_start = rows.saturating_sub(footer_lines as u16).max(3);
-    let image_rows = footer_start.saturating_sub(2).max(5);
-    render_pixel_limits(cols, image_rows)
+    let area = ui::document_area(ratatui::layout::Rect::new(0, 0, cols, rows));
+    render_pixel_limits(area.width, area.height)
 }
 
 fn crop_page_boxes(
@@ -3046,14 +2696,21 @@ fn kitty_image_bytes(bitmap: &Bitmap, cols: u16, rows: u16) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(bitmap.width * bitmap.height * 4);
     for y in 0..bitmap.height {
         let row = &bitmap.data[y * bitmap.stride..][..bitmap.width * 4];
-        for px in row.chunks_exact(4) {
+        for px in row.as_chunks::<4>().0 {
             rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
         }
     }
     let encoded = base64_encode(&rgba);
     let mut out = Vec::with_capacity(encoded.len() + 128);
-    let display_cols = bitmap.width.div_ceil(10).clamp(1, cols as usize);
-    let display_rows = bitmap.height.div_ceil(20).clamp(1, rows as usize);
+    let (cell_width, cell_height) = cell_pixel_size();
+    let display_cols = bitmap
+        .width
+        .div_ceil(cell_width)
+        .clamp(1, cols.max(1) as usize);
+    let display_rows = bitmap
+        .height
+        .div_ceil(cell_height)
+        .clamp(1, rows.max(1) as usize);
     let header = format!(
         "\x1b_Ga=T,f=32,s={},v={},c={},r={},q=2,m=0;",
         bitmap.width, bitmap.height, display_cols, display_rows
@@ -3413,6 +3070,201 @@ fn plural(n: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
+
+    fn empty_state() -> Result<State> {
+        State::new(
+            Args {
+                pdf: None,
+                page: 1,
+                out: None,
+                overwrite: false,
+                format: None,
+                scan: false,
+                scan_dpi: None,
+            },
+            tempfile::tempdir()?,
+        )
+    }
+
+    #[test]
+    fn successful_scan_is_undoable_and_later_failure_keeps_it() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut state = empty_state()?;
+        let fixture = state.temp.path().join("fixture.pdf");
+        bitmap_to_pdf_with_page_size(
+            &Bitmap {
+                width: 1,
+                height: 1,
+                stride: 4,
+                data: vec![255; 4],
+            },
+            &fixture,
+            PageSize {
+                width: 100.0,
+                height: 200.0,
+            },
+        )?;
+        let program = state.temp.path().join("fake-scanimage");
+        fs::write(&program, "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --output-file) shift; output=$1;; esac; shift; done\ncp \"$SCAN_FIXTURE\" \"$output\"\n")?;
+        // Pass the fixture as a literal argument through a script-specific variable,
+        // without changing the process-wide environment used by parallel tests.
+        let script = format!(
+            "#!/bin/sh\nSCAN_FIXTURE={}\n{}",
+            shell_words::quote(&fixture.to_string_lossy()),
+            fs::read_to_string(&program)?
+        );
+        fs::write(&program, script)?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+        let options = scanning::Options {
+            device: Some("test".into()),
+            ..Default::default()
+        };
+        let job = scanning::Job::start_with(&options, state.temp.path(), &program, None)?;
+        state.scan = Some(scanning::Session {
+            options: options.clone(),
+            job: Some(job),
+            progress: Default::default(),
+            error: None,
+            cancelling: false,
+            pages_added: 0,
+            ready: false,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !state.scan.as_ref().unwrap().ready {
+            handle_scan_input(&mut state, Input::Unknown)?;
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(state.page_count, 1);
+        assert!(state.dirty);
+        let snapshot = state.current_snapshot;
+        let failed_program = state.temp.path().join("failed-scanimage");
+        fs::write(
+            &failed_program,
+            "#!/bin/sh\nprintf 'Scanner is busy\\n' >&2\nexit 3\n",
+        )?;
+        fs::set_permissions(&failed_program, fs::Permissions::from_mode(0o700))?;
+        let job = scanning::Job::start_with(&options, state.temp.path(), &failed_program, None)?;
+        state.scan = Some(scanning::Session {
+            options,
+            job: Some(job),
+            progress: Default::default(),
+            error: None,
+            cancelling: false,
+            pages_added: 0,
+            ready: false,
+        });
+        while state.scan.as_ref().unwrap().error.is_none() {
+            handle_scan_input(&mut state, Input::Unknown)?;
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(state.current_snapshot, snapshot);
+        assert_eq!(state.page_count, 1);
+        handle_scan_input(&mut state, Input::Esc)?;
+        assert!(state.scan.is_none());
+        undo(&mut state)?;
+        assert_eq!(state.page_count, 0);
+        redo(&mut state)?;
+        assert_eq!(state.page_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn shortcuts_work_with_cyrillic_but_text_input_is_unchanged() -> Result<()> {
+        for c in ['p', 'з'] {
+            assert!(matches!(
+                input_from_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(c),
+                    KeyModifiers::CONTROL
+                ))),
+                Input::Ctrl('p')
+            ));
+        }
+        assert!(matches!(
+            actions::normal_input(Input::Char('К')),
+            Input::Char('R')
+        ));
+        assert!(matches!(
+            actions::normal_input(Input::Char('і')),
+            Input::Char('s')
+        ));
+        let mut state = empty_state()?;
+        state.command = Some(actions::LineInput::new("add "));
+        for c in "фото.pdf".chars() {
+            handle_input(&mut state, "kitty", Input::Char(c))?;
+        }
+        assert_eq!(state.command.as_ref().unwrap().text, "add фото.pdf");
+        let repeated =
+            KeyEvent::new_with_kind(KeyCode::Char('з'), KeyModifiers::ALT, KeyEventKind::Repeat);
+        assert!(matches!(
+            input_from_event(Event::Key(repeated)),
+            Input::Unknown
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn searchable_actions_execute_and_prefill_commands() -> Result<()> {
+        let mut state = empty_state()?;
+        state.page_count = 4;
+        handle_input(&mut state, "kitty", Input::Function(1))?;
+        for c in "select all".chars() {
+            handle_input(&mut state, "kitty", Input::Char(c))?;
+        }
+        handle_input(&mut state, "kitty", Input::Enter)?;
+        assert_eq!(state.selected, BTreeSet::from([0, 1, 2, 3]));
+        assert!(state.help.is_none());
+        handle_input(&mut state, "kitty", Input::Function(1))?;
+        for c in "page range".chars() {
+            handle_input(&mut state, "kitty", Input::Char(c))?;
+        }
+        handle_input(&mut state, "kitty", Input::Enter)?;
+        assert_eq!(state.command.as_ref().unwrap().text, "select ");
+        for c in "1,3".chars() {
+            handle_input(&mut state, "kitty", Input::Char(c))?;
+        }
+        handle_input(&mut state, "kitty", Input::Enter)?;
+        assert_eq!(state.selected, BTreeSet::from([0, 2]));
+        Ok(())
+    }
+
+    #[test]
+    fn print_page_sets_follow_current_edited_document() -> Result<()> {
+        let mut state = empty_state()?;
+        state.page_count = 5;
+        state.page = 3;
+        state.selected = BTreeSet::from([0, 2]);
+        let mut options = printing::PrintOptions::default();
+        assert_eq!(print_pages(&options, &state)?, [0, 1, 2, 3, 4]);
+        options.pages = "current".into();
+        assert_eq!(print_pages(&options, &state)?, [3]);
+        options.pages = "selected".into();
+        assert_eq!(print_pages(&options, &state)?, [0, 2]);
+        options.pages = "1,3-5".into();
+        assert_eq!(print_pages(&options, &state)?, [0, 2, 3, 4]);
+        options.pages = "0".into();
+        assert!(print_pages(&options, &state).is_err());
+        options.pages = "6".into();
+        assert!(print_pages(&options, &state).is_err());
+        options.pages = "selected".into();
+        state.selected.clear();
+        assert!(print_pages(&options, &state).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unsaved_changes_require_save_or_explicit_discard() -> Result<()> {
+        let mut state = empty_state()?;
+        state.dirty = true;
+        assert!(command_line(&mut state, "kitty", ":q").is_err());
+        assert!(matches!(
+            command_line(&mut state, "kitty", ":q!")?,
+            UiAction::Quit
+        ));
+        Ok(())
+    }
 
     #[test]
     fn parses_pages_and_ranges() {
@@ -3441,6 +3293,84 @@ mod tests {
     fn detects_images_case_insensitively() {
         assert!(is_image(Path::new("scan.JPG")));
         assert!(!is_image(Path::new("scan.pdf")));
+    }
+
+    #[test]
+    fn quit_commands_return_to_ui_for_cleanup() -> Result<()> {
+        let mut state = State::new(
+            Args {
+                pdf: None,
+                page: 1,
+                out: None,
+                overwrite: false,
+                format: None,
+                scan: false,
+                scan_dpi: None,
+            },
+            tempfile::tempdir()?,
+        )?;
+        for command in [":q", "quit", ":exit", "close"] {
+            assert!(matches!(
+                command_line(&mut state, "kitty", command)?,
+                UiAction::Quit
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn move_places_pages_before_original_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bitmap = Bitmap {
+            width: 1,
+            height: 1,
+            stride: 4,
+            data: vec![255; 4],
+        };
+        let mut parts = Vec::new();
+        for width in [40, 80, 120, 160] {
+            let path = temp.path().join(format!("page-{width}.pdf"));
+            bitmap_to_pdf_with_page_size(
+                &bitmap,
+                &path,
+                PageSize {
+                    width: width as f64,
+                    height: 200.0,
+                },
+            )?;
+            parts.push(path);
+        }
+        let input = temp.path().join("pages.pdf");
+        concat_pdfs(&parts, &input)?;
+        for (selected, target, expected) in [
+            (vec![0], 3, vec![80, 40, 120, 160]),
+            (vec![3], 2, vec![40, 160, 80, 120]),
+            (vec![0, 2], 4, vec![80, 40, 120, 160]),
+        ] {
+            let mut state = State::new(
+                Args {
+                    pdf: Some(input.clone()),
+                    page: 1,
+                    out: None,
+                    overwrite: false,
+                    format: None,
+                    scan: false,
+                    scan_dpi: None,
+                },
+                tempfile::tempdir()?,
+            )?;
+            state.selected = selected.into_iter().collect();
+            move_pages(&mut state, target)?;
+            let widths = (1..=4)
+                .map(|page| pdf_page_size(state.current_pdf()?, page).map(|size| size.width as u32))
+                .collect::<Result<Vec<_>>>()?;
+            assert_eq!(widths, expected);
+            undo(&mut state)?;
+            assert_eq!(pdf_page_size(state.current_pdf()?, 1)?.width, 40.0);
+            assert!(move_pages(&mut state, 0).is_err());
+            assert!(move_pages(&mut state, 5).is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -3512,6 +3442,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3566,6 +3498,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3591,6 +3525,8 @@ mod tests {
             out: None,
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3626,6 +3562,8 @@ mod tests {
             out: None,
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3654,6 +3592,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3689,6 +3629,8 @@ mod tests {
             out: Some(temp.path().join("nested").join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3720,6 +3662,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3746,6 +3690,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3777,6 +3723,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3812,6 +3760,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3841,6 +3791,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3923,6 +3875,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -3974,6 +3928,8 @@ mod tests {
             out: Some(temp.path().join("out.pdf")),
             overwrite: false,
             format: Some("kitty".into()),
+            scan: false,
+            scan_dpi: None,
         };
         let state_temp = tempfile::tempdir()?;
         let mut state = State::new(args, state_temp)?;
@@ -4036,7 +3992,7 @@ mod tests {
     fn solid_bitmap(width: usize, height: usize, rgba: [u8; 4]) -> Bitmap {
         let stride = width * 4;
         let mut data = vec![0_u8; stride * height];
-        for px in data.chunks_exact_mut(4) {
+        for px in data.as_chunks_mut::<4>().0 {
             px[0] = rgba[2];
             px[1] = rgba[1];
             px[2] = rgba[0];

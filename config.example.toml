@@ -1,0 +1,35 @@
+# pdfview configuration. Missing settings use built-in defaults.
+# Reload without restarting: F5 or :reload.
+[theme]
+background = "#1e1e2e"
+surface = "#313244"
+foreground = "#cdd6f4"
+muted = "#7f849c"
+border = "#585b70"
+accent = "#cba6f7"
+selected_background = "#cba6f7"
+selected_foreground = "#1e1e2e"
+success = "#a6e3a1"
+warning = "#f9e2af"
+error = "#f38ba8"
+
+[printing]
+# Omit printer/paper to use CUPS defaults.
+# printer = "DeskJet_3630"
+# paper = "A4"
+copies = 1
+pages = "all"
+color = "auto"         # auto, monochrome, color
+orientation = "auto"   # auto, portrait, landscape
+sides = "auto"         # auto, one-sided, long-edge, short-edge
+paper_type = "auto"    # auto, plain, photo
+quality = "auto"       # auto, draft, normal, high
+scaling = "auto"       # auto, fit, actual
+
+[scanning]
+# A single connected scanner is selected automatically; cameras are ignored.
+# device = "hpaio:/usb/Your_scanner?serial=..."
+dpi = 300
+mode = "Color"         # SANE backend name: Color, Gray, Lineart, etc.
+# source = "Flatbed"   # Omit to use the scanner default.
+timeout_seconds = 300
